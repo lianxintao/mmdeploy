@@ -324,3 +324,10 @@ from sglang.srt.managers.scheduler import PPProxyTensors
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
+现在的disa
+        logger.info(
+            f"decode rank: engine_rank={self.kv_mgr.kv_args.engine_rank}, "
+            f"target_tp_ranks={self.target_tp_ranks}, target_dp_group={self.target_dp_group}, "
+            f"bootstrap_addr={self.bootstrap_addr}"
+        )
+ggregation 不支持 pipline 并行，原因是在prefill，decode 的文件中并未像scheduler文件中那样单独实现了适应与P/D disaggregation脚骨的 event_loop_pp函数，并排查其他相关问题，给我增加PD分离模式的pipline 并行功能，保宁完善
