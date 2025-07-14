@@ -331,3 +331,134 @@ from sglang.srt.managers.scheduler import PPProxyTensors
             f"bootstrap_addr={self.bootstrap_addr}"
         )
 ggregation 不支持 pipline 并行，原因是在prefill，decode 的文件中并未像scheduler文件中那样单独实现了适应与P/D disaggregation脚骨的 event_loop_pp函数，并排查其他相关问题，给我增加PD分离模式的pipline 并行功能，保宁完善
+
+
+
+        # PP stage之间同一个req的kv_receiver状态同步
+        if hasattr(self.scheduler, 'pp_group') and self.scheduler.pp_group.world_size > 1:
+            self._sync_kv_receiver_states_across_pp_stages(polls)
+
+    def _sync_kv_receiver_states_across_pp_stages(self, polls):
+        """
+        在PP stage之间同步kv_receiver状态，使用all_reduce MIN操作确保状态一致性
+        类似于 dist.all_reduce(tensor_to_reduce, op=dist.ReduceOp.MIN, group=pp_group)
+        """
+        try:
+            current_rank = self.scheduler.pp_group.rank_in_group
+            pp_world_size = self.scheduler.pp_group.world_size
+            
+            if pp_world_size <= 1:
+                return  # 只有一个PP stage，无需同步
+            
+            # 构建request ID到本地队列索引的映射
+            req_id_to_local_idx = {}
+            for i, decode_req in enumerate(self.queue):
+                req_id_to_local_idx[decode_req.req.rid] = i
+            
+            # 收集所有PP stages的kv_receiver状态
+            all_stages_states = self._collect_all_pp_stages_states(polls)
+            
+            # 对于每个请求，使用MIN操作同步状态
+            sync_updates = self._apply_min_reduce_logic(all_stages_states, req_id_to_local_idx, polls)
+            
+            # 输出同步日志
+            if sync_updates:
+                logger.info(
+                    f"PP Stage {current_rank} kv_receiver sync updates:\n" +
+                    "\n".join(sync_updates)
+                )
+            else:
+                logger.debug(f"PP Stage {current_rank} kv_receiver states already consistent")
+            
+            # 最终barrier同步，确保所有stages完成状态同步
+            self.scheduler.pp_group.barrier()
+            
+        except Exception as e:
+            logger.warning(f"PP kv_receiver state sync failed on stage {current_rank}: {e}")
+            # 同步失败时继续执行，避免阻塞整个流程
+            pass
+
+    def _collect_all_pp_stages_states(self, polls):
+        """收集所有PP stages的kv_receiver状态"""
+        current_rank = self.scheduler.pp_group.rank_in_group
+        pp_world_size = self.scheduler.pp_group.world_size
+        
+        # 构建当前stage的状态
+        current_stage_requests = {}
+        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+            current_stage_requests[decode_req.req.rid] = {
+                "poll_status": int(poll),
+                "bootstrap_room": decode_req.req.bootstrap_room,
+                "local_idx": i
+            }
+        
+        # 收集所有stages的状态
+        all_stages_states = [None] * pp_world_size
+        all_stages_states[current_rank] = current_stage_requests
+        
+        # 与其他stages交换状态信息
+        for other_rank in range(pp_world_size):
+            if other_rank == current_rank:
+                continue
+                
+            # 使用rank顺序避免死锁
+            if current_rank < other_rank:
+                self.scheduler.pp_group.send_object(current_stage_requests, dst=other_rank)
+                other_stage_requests = self.scheduler.pp_group.recv_object(src=other_rank)
+            else:
+                other_stage_requests = self.scheduler.pp_group.recv_object(src=other_rank)
+                self.scheduler.pp_group.send_object(current_stage_requests, dst=other_rank)
+            
+            all_stages_states[other_rank] = other_stage_requests
+        
+        return all_stages_states
+
+    def _apply_min_reduce_logic(self, all_stages_states, req_id_to_local_idx, polls):
+        """
+        应用MIN reduce逻辑，对于相同的kv_receiver取最小状态值
+        类似于: tensor_to_reduce = min(tensor_to_reduce) across all PP stages
+        """
+        current_rank = self.scheduler.pp_group.rank_in_group
+        sync_updates = []
+        
+        # 收集所有stages中出现的请求ID
+        all_req_ids = set()
+        for stage_requests in all_stages_states:
+            if stage_requests is not None:
+                all_req_ids.update(stage_requests.keys())
+        
+        # 对每个请求ID进行MIN reduce操作
+        for req_id in all_req_ids:
+            if req_id not in req_id_to_local_idx:
+                continue  # 当前stage没有这个请求，跳过
+                
+            local_idx = req_id_to_local_idx[req_id]
+            current_status = int(polls[local_idx])
+            
+            # 收集所有stages中这个请求的状态
+            req_statuses = []
+            stages_with_req = []
+            
+            for stage_rank, stage_requests in enumerate(all_stages_states):
+                if stage_requests is not None and req_id in stage_requests:
+                    req_statuses.append(stage_requests[req_id]["poll_status"])
+                    stages_with_req.append(stage_rank)
+            
+            if len(req_statuses) > 1:
+                # 使用MIN操作找到最小状态值（最保守的状态）
+                min_status = min(req_statuses)
+                
+                if min_status != current_status:
+                    # 更新本地状态为最小值
+                    polls[local_idx] = min_status
+                    sync_updates.append(
+                        f"Req {req_id}: MIN reduce updated poll_status from {current_status} "
+                        f"to {min_status} (stages: {stages_with_req}, statuses: {req_statuses})"
+                    )
+                else:
+                    logger.debug(
+                        f"Req {req_id}: Already at MIN status {current_status} "
+                        f"(stages: {stages_with_req}, statuses: {req_statuses})"
+                    )
+        
+        return sync_updates
