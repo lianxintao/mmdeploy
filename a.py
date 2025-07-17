@@ -891,3 +891,438 @@ spec:
                 operator: In
                 values:
                 - "deepseekr1-32b-pd-p"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# DeepSeek 32B 多机部署配置
+# 需要至少2台8卡机器
+# 使用 hostNetwork 直接通过宿主机IP访问
+
+---
+# Load Balancer Service - 可选：如果使用 hostNetwork，可以直接通过宿主机IP访问
+apiVersion: v1
+kind: Service
+metadata:
+  name: deepseek32b-lb-service
+spec:
+  type: NodePort
+  selector:
+    app: deepseek32b-loadbalancer
+    role: loadbalancer
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+      nodePort: 30800
+
+---
+# Prefill Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek32b-prefill
+  labels:
+    app: deepseek32b-prefill
+    yice: "true"
+    environment: test
+    release: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek32b-prefill
+      role: prefill
+  template:
+    metadata:
+      labels:
+        app: deepseek32b-prefill
+        role: prefill
+        component: prefill
+        yice: "true"
+        environment: test
+        release: test
+    spec:
+      containers:
+      - name: sglang-prefill
+        image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
+        command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --port
+        - "30000"
+        - --host
+        - "0.0.0.0"
+        - --model-path
+        - /models/DeepSeek-R1-Distill-Qwen-32B
+        - --page-size
+        - "64"
+        - --disaggregation-mode
+        - prefill
+        - --mem-fraction-static
+        - "0.85"
+        - --tp-size
+        - "8"  # 使用全部8张GPU
+        - --disaggregation-ib-device
+        - mlx5_bond_0
+        - --trust-remote-code
+        - --quantization
+        - fp8
+        - --kv-cache-dtype
+        - fp8_e5m2
+        - --attention-backend
+        - flashinfer
+        env:
+        - name: NVSHMEM_HCA_PE_MAPPING
+          value: "mlx5_bond_0:1:2"
+        - name: NVSHMEM_IB_GID_INDEX
+          value: "3"
+        - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
+          value: "1"
+        - name: SGLANG_SET_CPU_AFFINITY
+          value: "true"
+        - name: SGL_ENABLE_JIT_DEEPGEMM
+          value: "1"
+        - name: NCCL_IB_QPS_PER_CONNECTION
+          value: "8"
+        - name: NCCL_IB_SPLIT_DATA_ON_QPS
+          value: "1"
+        - name: NCCL_NET_PLUGIN
+          value: none
+        - name: NCCL_IB_TC
+          value: "136"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: MC_TE_METRIC
+          value: "false"
+        - name: NCCL_IB_SL
+          value: "5"
+        - name: NCCL_IB_HCA
+          value: "mlx5_bond_0"
+        - name: NCCL_SOCKET_IFNAME
+          value: "bond1"
+        ports:
+        - containerPort: 30000
+          protocol: TCP
+        readinessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: 30000
+        resources:
+          limits:
+            nvidia.com/gpu: "8"  # 使用全部8张GPU
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+          privileged: true
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /models
+          name: host-models
+        - mountPath: /dev/infiniband
+          name: ib
+
+      # 使用 affinity 选择匹配的机器，并且不与 prefill/decode 节点在同一台机器
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: org
+                operator: In
+                values:
+                - "yiceai"
+              - key: yiceai
+                operator: In
+                values:
+                - "true"
+              - key: deploy
+                operator: In
+                values:
+                - "deepseekr1-32b-pd-p"
+        # 反亲和性确保 LB 不与 prefill/decode 在同一节点（可选）
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - deepseek32b-prefill
+                  - deepseek32b-decode
+              topologyKey: kubernetes.io/hostname
+        # 反亲和性确保 prefill 和 decode 不在同一节点
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - deepseek32b-decode
+            topologyKey: kubernetes.io/hostname
+      volumes:
+      - emptyDir:
+          medium: Memory
+        name: dshm
+      - hostPath:
+          path: /export/models
+        name: host-models
+      - hostPath:
+          path: /dev/infiniband
+        name: ib
+      dnsPolicy: Default
+      hostIPC: true
+      hostNetwork: true
+
+---
+# Decode Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek32b-decode
+  labels:
+    app: deepseek32b-decode
+    yice: "true"
+    environment: test
+    release: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek32b-decode
+      role: decode
+  template:
+    metadata:
+      labels:
+        app: deepseek32b-decode
+        role: decode
+        component: decode
+        yice: "true"
+        environment: test
+        release: test
+    spec:
+      containers:
+      - name: sglang-decode
+        image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
+        command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --port
+        - "30001"
+        - --host
+        - "0.0.0.0"
+        - --model-path
+        - /models/DeepSeek-R1-Distill-Qwen-32B
+        - --page-size
+        - "64"
+        - --disaggregation-mode
+        - decode
+        - --mem-fraction-static
+        - "0.85"
+        - --tp-size
+        - "8"  # 使用全部8张GPU
+        - --disaggregation-ib-device
+        - mlx5_bond_0
+        - --trust-remote-code
+        - --quantization
+        - fp8
+        - --kv-cache-dtype
+        - fp8_e5m2
+        - --attention-backend
+        - flashinfer
+        env:
+        - name: NVSHMEM_HCA_PE_MAPPING
+          value: "mlx5_bond_0:1:2"
+        - name: NVSHMEM_IB_GID_INDEX
+          value: "3"
+        - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
+          value: "1"
+        - name: SGLANG_SET_CPU_AFFINITY
+          value: "true"
+        - name: SGL_ENABLE_JIT_DEEPGEMM
+          value: "1"
+        - name: NCCL_IB_QPS_PER_CONNECTION
+          value: "8"
+        - name: NCCL_IB_SPLIT_DATA_ON_QPS
+          value: "1"
+        - name: NCCL_NET_PLUGIN
+          value: none
+        - name: NCCL_IB_TC
+          value: "136"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: MC_TE_METRIC
+          value: "false"
+        - name: NCCL_IB_SL
+          value: "5"
+        - name: NCCL_IB_HCA
+          value: "mlx5_bond_0"
+        - name: NCCL_SOCKET_IFNAME
+          value: "bond1"
+        ports:
+        - containerPort: 30001
+          protocol: TCP
+        readinessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: 30001
+        resources:
+          limits:
+            nvidia.com/gpu: "8"  # 使用全部8张GPU
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+          privileged: true
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /models
+          name: host-models
+        - mountPath: /dev/infiniband
+          name: ib
+
+      # 使用 affinity 选择匹配的机器
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: org
+                operator: In
+                values:
+                - "yiceai"
+              - key: yiceai
+                operator: In
+                values:
+                - "true"
+              - key: deploy
+                operator: In
+                values:
+                - "deepseekr1-32b-pd-p"
+        # 反亲和性确保 prefill 和 decode 不在同一节点
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - deepseek32b-prefill
+            topologyKey: kubernetes.io/hostname
+      volumes:
+      - emptyDir:
+          medium: Memory
+        name: dshm
+      - hostPath:
+          path: /export/models
+        name: host-models
+      - hostPath:
+          path: /dev/infiniband
+        name: ib
+      dnsPolicy: Default
+      hostIPC: true
+      hostNetwork: true
+
+---
+# Load Balancer Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek32b-loadbalancer
+  labels:
+    app: deepseek32b-loadbalancer
+    yice: "true"
+    environment: test
+    release: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek32b-loadbalancer
+      role: loadbalancer
+  template:
+    metadata:
+      labels:
+        app: deepseek32b-loadbalancer
+        role: loadbalancer
+        component: loadbalancer
+        yice: "true"
+        environment: test
+        release: test
+    spec:
+      containers:
+      - name: sgl-loadbalancer
+        image: lmsysorg/sglang:latest
+        command:
+        - python
+        - -m
+        - sglang.srt.disaggregation.mini_lb
+        - --prefill
+        - $(PREFILL_HOST_URL)
+        - --decode
+        - $(DECODE_HOST_URL)
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        env:
+        - name: PREFILL_HOST_URL
+          value: "http://192.168.1.100:30000"  # 替换为实际的 prefill 宿主机IP
+        - name: DECODE_HOST_URL
+          value: "http://192.168.1.101:30001"  # 替换为实际的 decode 宿主机IP
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        readinessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: 8000
+        resources:
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+
+      # 使用 affinity 选择匹配的机器
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: org
+                operator: In
+                values:
+                - "yiceai"
+              - key: yiceai
+                operator: In
+                values:
+                - "true"
+              - key: deploy
+                operator: In
+                values:
+                - "deepseekr1-32b-pd-p"
