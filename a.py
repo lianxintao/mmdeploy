@@ -463,8 +463,6 @@ ggregation 不支持 pipline 并行，原因是在prefill，decode 的文件中�
         
         return sync_updates
 
-
-
 # DeepSeek 32B 多机LWS配置
 # 需要至少2台8卡机器
 
@@ -497,8 +495,6 @@ spec:
     role: worker
     environment: test
     release: test
-    environment: test
-    release: test
   ports:
     - protocol: TCP
       port: 30001
@@ -515,6 +511,8 @@ spec:
   selector:
     leaderworkerset.sigs.k8s.io/name: deepseek32b-main
     role: worker
+    environment: test
+    release: test
   ports:
     - protocol: TCP
       port: 8000
@@ -544,7 +542,7 @@ spec:
       spec:
         containers:
         - name: sglang-prefill
-          image: lmsysorg/sglang:latest
+          image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
           command:
           - python3
           - -m
@@ -554,44 +552,27 @@ spec:
           - --host
           - "0.0.0.0"
           - --model-path
-          - /work/models
-          - --chunked-prefill-size
-          - "262144"
-          - --max-prefill-tokens
-          - "16384"
+          - /models/DeepSeek-R1-Distill-Qwen-32B
           - --page-size
           - "64"
-          - --enable-dp-attention
-          - --enable-dp-lm-head
-          - --dp-size
-          - "2"
-          - --enable-deepep-moe
-          - --deepep-mode
-          - normal
           - --disaggregation-mode
           - prefill
           - --mem-fraction-static
-          - "0.7"
-          - --context-length
-          - "16384"
+          - "0.85"
           - --tp-size
           - "8"  # 使用全部8张GPU
           - --disaggregation-ib-device
-          - mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
+          - mlx5_bond_0
           - --trust-remote-code
-          - --disaggregation-ib-device
-          - mlx5_bond_0,mlx5_bond_1,mlx5_bond_2,mlx5_bond_3
-          - --ep-num-redundant-experts
-          - "16"
-          - --moe-dense-tp-size
-          - "1"
-          - --max-running-requests
-          - "512"
+          - --quantization
+          - fp8
+          - --kv-cache-dtype
+          - fp8_e5m2
+          - --attention-backend
+          - flashinfer
           env:
-          - name: CUDA_VISIBLE_DEVICES
-            value: "0,1,2,3,4,5,6,7"
           - name: NVSHMEM_HCA_PE_MAPPING
-            value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+            value: "mlx5_bond_0:1:2"
           - name: NVSHMEM_IB_GID_INDEX
             value: "3"
           - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
@@ -615,7 +596,9 @@ spec:
           - name: NCCL_IB_SL
             value: "5"
           - name: NCCL_IB_HCA
-            value: ^=mlx5_0,mlx5_5,mlx5_6
+            value: "mlx5_bond_0"
+          - name: NCCL_SOCKET_IFNAME
+            value: "bond1"
           ports:
           - containerPort: 30000
             protocol: TCP
@@ -634,64 +617,41 @@ spec:
           volumeMounts:
           - mountPath: /dev/shm
             name: dshm
-          - mountPath: /work/models
-            name: model
+          - mountPath: /models
+            name: host-models
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
-            name: cf
-          - mountPath: /root/.cache
-            name: sgl-cache
-        
-        # 使用 affinity 选择匹配的机器
         affinity:
           nodeAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
               nodeSelectorTerms:
               - matchExpressions:
-                - key: pd
+                - key: org
                   operator: In
                   values:
-                  - "yes"
-                - key: gpu-type
+                  - "yiceai"
+                - key: yiceai
                   operator: In
                   values:
-                  - "L20"
-                - key: infiniband
+                  - "true"
+                - key: deploy
                   operator: In
                   values:
-                  - "enabled"
-            preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              preference:
-                matchExpressions:
-                - key: node-type
-                  operator: In
-                  values:
-                  - "prefill"
-        tolerations:
-        - key: bopd
-          operator: Exists
-        - key: node-role
-          operator: Exists
+                  - "deepseekr1-32b-pd-p"
         volumes:
         - emptyDir:
             medium: Memory
           name: dshm
         - hostPath:
-            path: /data1/maas_hosted_models/models/DeepSeek-32B
-          name: model
+            path: /export/models
+          name: host-models
         - hostPath:
             path: /dev/infiniband
           name: ib
-        - hostPath:
-            path: /data1/maas_hosted_models/models/fused_moe_triton/configs
-          name: cf
-        - hostPath:
-            path: /data1/sgl_cache
-            type: DirectoryOrCreate
-          name: sgl-cache
-    
+        dnsPolicy: ClusterFirstWithHostNet
+        hostIPC: true
+        hostNetwork: true
+
     # Worker Template - Decode节点（使用另一台完整的8卡机器）
     workerTemplate:
       metadata:
@@ -705,7 +665,7 @@ spec:
         containers:
         # Decode容器
         - name: sglang-decode
-          image: lmsysorg/sglang:latest
+          image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
           command:
           - python3
           - -m
@@ -715,66 +675,53 @@ spec:
           - --host
           - "0.0.0.0"
           - --model-path
-          - /work/models
-          - --chunked-prefill-size
-          - "262144"
+          - /models/DeepSeek-R1-Distill-Qwen-32B
           - --page-size
           - "64"
-          - --enable-dp-attention
-          - --enable-dp-lm-head
-          - --dp-size
-          - "2"
-          - --enable-deepep-moe
-          - --deepep-mode
-          - low_latency
           - --disaggregation-mode
           - decode
           - --mem-fraction-static
-          - "0.8"
-          - --context-length
-          - "16384"
-          - --cuda-graph-max-bs
-          - "64"
-          - --max-running-requests
-          - "1024"
+          - "0.85"
           - --tp-size
           - "8"  # 使用全部8张GPU
+          - --disaggregation-ib-device
+          - mlx5_bond_0
           - --trust-remote-code
-          - --ep-num-redundant-experts
-          - "16"
-          - --moe-dense-tp-size
-          - "1"
+          - --quantization
+          - fp8
+          - --kv-cache-dtype
+          - fp8_e5m2
+          - --attention-backend
+          - flashinfer
           env:
-          - name: CUDA_VISIBLE_DEVICES
-            value: "0,1,2,3,4,5,6,7"
-          - name: NVSHMEM_IB_TRAFFIC_CLASS
-            value: "16"
+          - name: NVSHMEM_HCA_PE_MAPPING
+            value: "mlx5_bond_0:1:2"
           - name: NVSHMEM_IB_GID_INDEX
             value: "3"
           - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
             value: "1"
-          - name: NVSHMEM_HCA_PE_MAPPING
-            value: "mlx5_bond_0:1:2,mlx5_bond_1:1:2,mlx5_bond_2:1:2,mlx5_bond_3:1:2"
+          - name: SGLANG_SET_CPU_AFFINITY
+            value: "true"
+          - name: SGL_ENABLE_JIT_DEEPGEMM
+            value: "1"
           - name: NCCL_IB_QPS_PER_CONNECTION
             value: "8"
           - name: NCCL_IB_SPLIT_DATA_ON_QPS
             value: "1"
           - name: NCCL_NET_PLUGIN
-            value: "none"
+            value: none
           - name: NCCL_IB_TC
             value: "136"
           - name: NCCL_MIN_NCHANNELS
             value: "4"
           - name: MC_TE_METRIC
-            value: "true"
+            value: "false"
           - name: NCCL_IB_SL
             value: "5"
-          - name: SGLANG_MOONCAKE_TRANS_THREAD
-            value: "16"
-          - name: SGL_ENABLE_JIT_DEEPGEMM
-            value: "1"
           - name: NCCL_IB_HCA
-            value: ^=mlx5_0,mlx5_5,mlx5_6
+            value: "mlx5_bond_0"
+          - name: NCCL_SOCKET_IFNAME
+            value: "bond1"
           ports:
           - containerPort: 30001
             protocol: TCP
@@ -791,20 +738,16 @@ spec:
               - IPC_LOCK
             privileged: true
           volumeMounts:
-          - mountPath: /root/.cache
-            name: sgl-cache
           - mountPath: /dev/shm
             name: dshm
-          - mountPath: /work/models
-            name: model
+          - mountPath: /models
+            name: host-models
           - mountPath: /dev/infiniband
             name: ib
-          - mountPath: /sgl-workspace/sglang/python/sglang/srt/layers/moe/fused_moe_triton/configs
-            name: cf
-        
+
         # Load Balancer容器
         - name: sgl-loadbalancer
-          image: lmsysorg/sglang:latest
+          image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
           command:
           - python
           - -m
@@ -828,72 +771,41 @@ spec:
             limits:
               cpu: "2"
               memory: "4Gi"
-        
-        # 使用 affinity 选择匹配的机器，确保调度到不同的节点
+
         affinity:
           nodeAffinity:
             requiredDuringSchedulingIgnoredDuringExecution:
               nodeSelectorTerms:
               - matchExpressions:
-                - key: pd
+                - key: org
                   operator: In
                   values:
-                  - "yes"
-                - key: gpu-type
+                  - "yiceai"
+                - key: yiceai
                   operator: In
                   values:
-                  - "L20"
-                - key: infiniband
+                  - "true"
+                - key: deploy
                   operator: In
                   values:
-                  - "enabled"
-            preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              preference:
-                matchExpressions:
-                - key: node-type
-                  operator: In
-                  values:
-                  - "decode"
-          podAntiAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-            - labelSelector:
-                matchExpressions:
-                - key: role
-                  operator: In
-                  values:
-                  - leader
-                - key: component
-                  operator: In
-                  values:
-                  - prefill
-              topologyKey: kubernetes.io/hostname
-        tolerations:
-        - key: bopd
-          operator: Exists
-        - key: node-role
-          operator: Exists
+                  - "deepseekr1-32b-pd-p"
         volumes:
-        - hostPath:
-            path: /data1/sgl_cache1
-            type: DirectoryOrCreate
-          name: sgl-cache
         - emptyDir:
             medium: Memory
           name: dshm
         - hostPath:
+            path: /export/models
+          name: host-models
+        - hostPath:
             path: /dev/infiniband
           name: ib
-        - hostPath:
-            path: /data1/maas_hosted_models/models/DeepSeek-32B
-          name: model
-        - hostPath:
-            path: /data1/maas_hosted_models/models/fused_moe_triton/configs
-          name: cf
-    
+        dnsPolicy: ClusterFirstWithHostNet
+        hostIPC: true
+        hostNetwork: true
+
     restartPolicy: RecreateGroupOnPodRestart
     size: 1
-  
+
   networkConfig:
     subdomainPolicy: Shared
   replicas: 1
