@@ -463,7 +463,7 @@ ggregation 不支持 pipline 并行，原因是在prefill，decode 的文件中�
         
         return sync_updates
 
-# DeepSeek 32B 多机LWS配置
+# DeepSeek 32B 多机部署配置
 # 需要至少2台8卡机器
 
 ---
@@ -474,8 +474,8 @@ metadata:
   name: deepseek32b-prefill-service
 spec:
   selector:
-    leaderworkerset.sigs.k8s.io/name: deepseek32b-main
-    role: leader
+    app: deepseek32b-prefill
+    role: prefill
     environment: test
     release: test
   ports:
@@ -491,8 +491,8 @@ metadata:
   name: deepseek32b-decode-service
 spec:
   selector:
-    leaderworkerset.sigs.k8s.io/name: deepseek32b-main
-    role: worker
+    app: deepseek32b-decode
+    role: decode
     environment: test
     release: test
   ports:
@@ -509,10 +509,8 @@ metadata:
 spec:
   type: NodePort
   selector:
-    leaderworkerset.sigs.k8s.io/name: deepseek32b-main
-    role: worker
-    environment: test
-    release: test
+    app: deepseek32b-loadbalancer
+    role: loadbalancer
   ports:
     - protocol: TCP
       port: 8000
@@ -520,298 +518,376 @@ spec:
       nodePort: 30800
 
 ---
-apiVersion: leaderworkerset.x-k8s.io/v1
-kind: LeaderWorkerSet
+# Prefill Deployment
+apiVersion: apps/v1
+kind: Deployment
 metadata:
-  name: deepseek32b-main
+  name: deepseek32b-prefill
   labels:
+    app: deepseek32b-prefill
     yice: "true"
     environment: test
     release: test
 spec:
-  leaderWorkerTemplate:
-    # Leader Template - Prefill 节点（使用一台完整的8卡机器）
-    leaderTemplate:
-      metadata:
-        labels:
-          role: leader
-          component: prefill
-          yice: "true"
-          environment: test
-          release: test
-      spec:
-        containers:
-        - name: sglang-prefill
-          image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
-          command:
-          - python3
-          - -m
-          - sglang.launch_server
-          - --port
-          - "30000"
-          - --host
-          - "0.0.0.0"
-          - --model-path
-          - /models/DeepSeek-R1-Distill-Qwen-32B
-          - --page-size
-          - "64"
-          - --disaggregation-mode
-          - prefill
-          - --mem-fraction-static
-          - "0.85"
-          - --tp-size
-          - "8"  # 使用全部8张GPU
-          - --disaggregation-ib-device
-          - mlx5_bond_0
-          - --trust-remote-code
-          - --quantization
-          - fp8
-          - --kv-cache-dtype
-          - fp8_e5m2
-          - --attention-backend
-          - flashinfer
-          env:
-          - name: NVSHMEM_HCA_PE_MAPPING
-            value: "mlx5_bond_0:1:2"
-          - name: NVSHMEM_IB_GID_INDEX
-            value: "3"
-          - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
-            value: "1"
-          - name: SGLANG_SET_CPU_AFFINITY
-            value: "true"
-          - name: SGL_ENABLE_JIT_DEEPGEMM
-            value: "1"
-          - name: NCCL_IB_QPS_PER_CONNECTION
-            value: "8"
-          - name: NCCL_IB_SPLIT_DATA_ON_QPS
-            value: "1"
-          - name: NCCL_NET_PLUGIN
-            value: none
-          - name: NCCL_IB_TC
-            value: "136"
-          - name: NCCL_MIN_NCHANNELS
-            value: "4"
-          - name: MC_TE_METRIC
-            value: "false"
-          - name: NCCL_IB_SL
-            value: "5"
-          - name: NCCL_IB_HCA
-            value: "mlx5_bond_0"
-          - name: NCCL_SOCKET_IFNAME
-            value: "bond1"
-          ports:
-          - containerPort: 30000
-            protocol: TCP
-          readinessProbe:
-            periodSeconds: 30
-            tcpSocket:
-              port: 30000
-          resources:
-            limits:
-              nvidia.com/gpu: "8"  # 使用全部8张GPU
-          securityContext:
-            capabilities:
-              add:
-              - IPC_LOCK
-            privileged: true
-          volumeMounts:
-          - mountPath: /dev/shm
-            name: dshm
-          - mountPath: /models
-            name: host-models
-          - mountPath: /dev/infiniband
-            name: ib
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-              - matchExpressions:
-                - key: org
-                  operator: In
-                  values:
-                  - "yiceai"
-                - key: yiceai
-                  operator: In
-                  values:
-                  - "true"
-                - key: deploy
-                  operator: In
-                  values:
-                  - "deepseekr1-32b-pd-p"
-        volumes:
-        - emptyDir:
-            medium: Memory
-          name: dshm
-        - hostPath:
-            path: /export/models
-          name: host-models
-        - hostPath:
-            path: /dev/infiniband
-          name: ib
-        dnsPolicy: ClusterFirstWithHostNet
-        hostIPC: true
-        hostNetwork: true
-
-    # Worker Template - Decode节点（使用另一台完整的8卡机器）
-    workerTemplate:
-      metadata:
-        labels:
-          role: worker
-          component: decode-lb
-          yice: "true"
-          environment: test
-          release: test
-      spec:
-        containers:
-        # Decode容器
-        - name: sglang-decode
-          image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
-          command:
-          - python3
-          - -m
-          - sglang.launch_server
-          - --port
-          - "30001"
-          - --host
-          - "0.0.0.0"
-          - --model-path
-          - /models/DeepSeek-R1-Distill-Qwen-32B
-          - --page-size
-          - "64"
-          - --disaggregation-mode
-          - decode
-          - --mem-fraction-static
-          - "0.85"
-          - --tp-size
-          - "8"  # 使用全部8张GPU
-          - --disaggregation-ib-device
-          - mlx5_bond_0
-          - --trust-remote-code
-          - --quantization
-          - fp8
-          - --kv-cache-dtype
-          - fp8_e5m2
-          - --attention-backend
-          - flashinfer
-          env:
-          - name: NVSHMEM_HCA_PE_MAPPING
-            value: "mlx5_bond_0:1:2"
-          - name: NVSHMEM_IB_GID_INDEX
-            value: "3"
-          - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
-            value: "1"
-          - name: SGLANG_SET_CPU_AFFINITY
-            value: "true"
-          - name: SGL_ENABLE_JIT_DEEPGEMM
-            value: "1"
-          - name: NCCL_IB_QPS_PER_CONNECTION
-            value: "8"
-          - name: NCCL_IB_SPLIT_DATA_ON_QPS
-            value: "1"
-          - name: NCCL_NET_PLUGIN
-            value: none
-          - name: NCCL_IB_TC
-            value: "136"
-          - name: NCCL_MIN_NCHANNELS
-            value: "4"
-          - name: MC_TE_METRIC
-            value: "false"
-          - name: NCCL_IB_SL
-            value: "5"
-          - name: NCCL_IB_HCA
-            value: "mlx5_bond_0"
-          - name: NCCL_SOCKET_IFNAME
-            value: "bond1"
-          ports:
-          - containerPort: 30001
-            protocol: TCP
-          readinessProbe:
-            periodSeconds: 30
-            tcpSocket:
-              port: 30001
-          resources:
-            limits:
-              nvidia.com/gpu: "8"  # 使用全部8张GPU
-          securityContext:
-            capabilities:
-              add:
-              - IPC_LOCK
-            privileged: true
-          volumeMounts:
-          - mountPath: /dev/shm
-            name: dshm
-          - mountPath: /models
-            name: host-models
-          - mountPath: /dev/infiniband
-            name: ib
-
-        # Load Balancer容器
-        - name: sgl-loadbalancer
-          image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
-          command:
-          - python
-          - -m
-          - sglang.srt.disaggregation.mini_lb
-          - --prefill
-          - http://deepseek32b-prefill-service:30000
-          - --decode
-          - http://localhost:30001
-          - --host
-          - 0.0.0.0
-          - --port
-          - "8000"
-          ports:
-          - containerPort: 8000
-            protocol: TCP
-          readinessProbe:
-            periodSeconds: 30
-            tcpSocket:
-              port: 8000
-          resources:
-            limits:
-              cpu: "2"
-              memory: "4Gi"
-
-        affinity:
-          nodeAffinity:
-            requiredDuringSchedulingIgnoredDuringExecution:
-              nodeSelectorTerms:
-              - matchExpressions:
-                - key: org
-                  operator: In
-                  values:
-                  - "yiceai"
-                - key: yiceai
-                  operator: In
-                  values:
-                  - "true"
-                - key: deploy
-                  operator: In
-                  values:
-                  - "deepseekr1-32b-pd-p"
-        volumes:
-        - emptyDir:
-            medium: Memory
-          name: dshm
-        - hostPath:
-            path: /export/models
-          name: host-models
-        - hostPath:
-            path: /dev/infiniband
-          name: ib
-        dnsPolicy: ClusterFirstWithHostNet
-        hostIPC: true
-        hostNetwork: true
-
-    restartPolicy: RecreateGroupOnPodRestart
-    size: 1
-
-  networkConfig:
-    subdomainPolicy: Shared
   replicas: 1
-  rolloutStrategy:
-    rollingUpdateConfiguration:
-      maxSurge: 0
-      maxUnavailable: 1
-    type: RollingUpdate
-  startupPolicy: LeaderCreated
+  selector:
+    matchLabels:
+      app: deepseek32b-prefill
+      role: prefill
+  template:
+    metadata:
+      labels:
+        app: deepseek32b-prefill
+        role: prefill
+        component: prefill
+        yice: "true"
+        environment: test
+        release: test
+    spec:
+      containers:
+      - name: sglang-prefill
+        image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
+        command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --port
+        - "30000"
+        - --host
+        - "0.0.0.0"
+        - --model-path
+        - /models/DeepSeek-R1-Distill-Qwen-32B
+        - --page-size
+        - "64"
+        - --disaggregation-mode
+        - prefill
+        - --mem-fraction-static
+        - "0.85"
+        - --tp-size
+        - "8"  # 使用全部8张GPU
+        - --disaggregation-ib-device
+        - mlx5_bond_0
+        - --trust-remote-code
+        - --quantization
+        - fp8
+        - --kv-cache-dtype
+        - fp8_e5m2
+        - --attention-backend
+        - flashinfer
+        env:
+        - name: NVSHMEM_HCA_PE_MAPPING
+          value: "mlx5_bond_0:1:2"
+        - name: NVSHMEM_IB_GID_INDEX
+          value: "3"
+        - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
+          value: "1"
+        - name: SGLANG_SET_CPU_AFFINITY
+          value: "true"
+        - name: SGL_ENABLE_JIT_DEEPGEMM
+          value: "1"
+        - name: NCCL_IB_QPS_PER_CONNECTION
+          value: "8"
+        - name: NCCL_IB_SPLIT_DATA_ON_QPS
+          value: "1"
+        - name: NCCL_NET_PLUGIN
+          value: none
+        - name: NCCL_IB_TC
+          value: "136"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: MC_TE_METRIC
+          value: "false"
+        - name: NCCL_IB_SL
+          value: "5"
+        - name: NCCL_IB_HCA
+          value: "mlx5_bond_0"
+        - name: NCCL_SOCKET_IFNAME
+          value: "bond1"
+        ports:
+        - containerPort: 30000
+          protocol: TCP
+        readinessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: 30000
+        resources:
+          limits:
+            nvidia.com/gpu: "8"  # 使用全部8张GPU
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+          privileged: true
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /models
+          name: host-models
+        - mountPath: /dev/infiniband
+          name: ib
+
+      # 使用 affinity 选择匹配的机器
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: org
+                operator: In
+                values:
+                - "yiceai"
+              - key: yiceai
+                operator: In
+                values:
+                - "true"
+              - key: deploy
+                operator: In
+                values:
+                - "deepseekr1-32b-pd-p"
+        # 反亲和性确保 prefill 和 decode 不在同一节点
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - deepseek32b-decode
+            topologyKey: kubernetes.io/hostname
+      volumes:
+      - emptyDir:
+          medium: Memory
+        name: dshm
+      - hostPath:
+          path: /export/models
+        name: host-models
+      - hostPath:
+          path: /dev/infiniband
+        name: ib
+      dnsPolicy: ClusterFirstWithHostNet
+      hostIPC: true
+      hostNetwork: true
+
+---
+# Decode Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek32b-decode
+  labels:
+    app: deepseek32b-decode
+    yice: "true"
+    environment: test
+    release: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek32b-decode
+      role: decode
+  template:
+    metadata:
+      labels:
+        app: deepseek32b-decode
+        role: decode
+        component: decode
+        yice: "true"
+        environment: test
+        release: test
+    spec:
+      containers:
+      - name: sglang-decode
+        image: aicr.byd.com/docker.io/lmsysorg/sglang:v0.4.7-cu124-post1
+        command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --port
+        - "30001"
+        - --host
+        - "0.0.0.0"
+        - --model-path
+        - /models/DeepSeek-R1-Distill-Qwen-32B
+        - --page-size
+        - "64"
+        - --disaggregation-mode
+        - decode
+        - --mem-fraction-static
+        - "0.85"
+        - --tp-size
+        - "8"  # 使用全部8张GPU
+        - --disaggregation-ib-device
+        - mlx5_bond_0
+        - --trust-remote-code
+        - --quantization
+        - fp8
+        - --kv-cache-dtype
+        - fp8_e5m2
+        - --attention-backend
+        - flashinfer
+        env:
+        - name: NVSHMEM_HCA_PE_MAPPING
+          value: "mlx5_bond_0:1:2"
+        - name: NVSHMEM_IB_GID_INDEX
+          value: "3"
+        - name: NVSHMEM_ENABLE_NIC_PE_MAPPING
+          value: "1"
+        - name: SGLANG_SET_CPU_AFFINITY
+          value: "true"
+        - name: SGL_ENABLE_JIT_DEEPGEMM
+          value: "1"
+        - name: NCCL_IB_QPS_PER_CONNECTION
+          value: "8"
+        - name: NCCL_IB_SPLIT_DATA_ON_QPS
+          value: "1"
+        - name: NCCL_NET_PLUGIN
+          value: none
+        - name: NCCL_IB_TC
+          value: "136"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: MC_TE_METRIC
+          value: "false"
+        - name: NCCL_IB_SL
+          value: "5"
+        - name: NCCL_IB_HCA
+          value: "mlx5_bond_0"
+        - name: NCCL_SOCKET_IFNAME
+          value: "bond1"
+        ports:
+        - containerPort: 30001
+          protocol: TCP
+        readinessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: 30001
+        resources:
+          limits:
+            nvidia.com/gpu: "8"  # 使用全部8张GPU
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+          privileged: true
+        volumeMounts:
+        - mountPath: /dev/shm
+          name: dshm
+        - mountPath: /models
+          name: host-models
+        - mountPath: /dev/infiniband
+          name: ib
+
+      # 使用 affinity 选择匹配的机器
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: org
+                operator: In
+                values:
+                - "yiceai"
+              - key: yiceai
+                operator: In
+                values:
+                - "true"
+              - key: deploy
+                operator: In
+                values:
+                - "deepseekr1-32b-pd-p"
+        # 反亲和性确保 prefill 和 decode 不在同一节点
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - deepseek32b-prefill
+            topologyKey: kubernetes.io/hostname
+      volumes:
+      - emptyDir:
+          medium: Memory
+        name: dshm
+      - hostPath:
+          path: /export/models
+        name: host-models
+      - hostPath:
+          path: /dev/infiniband
+        name: ib
+      dnsPolicy: ClusterFirstWithHostNet
+      hostIPC: true
+      hostNetwork: true
+
+---
+# Load Balancer Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deepseek32b-loadbalancer
+  labels:
+    app: deepseek32b-loadbalancer
+    yice: "true"
+    environment: test
+    release: test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: deepseek32b-loadbalancer
+      role: loadbalancer
+  template:
+    metadata:
+      labels:
+        app: deepseek32b-loadbalancer
+        role: loadbalancer
+        component: loadbalancer
+        yice: "true"
+        environment: test
+        release: test
+    spec:
+      containers:
+      - name: sgl-loadbalancer
+        image: lmsysorg/sglang:latest
+        command:
+        - python
+        - -m
+        - sglang.srt.disaggregation.mini_lb
+        - --prefill
+        - http://deepseek32b-prefill-service:30000
+        - --decode
+        - http://deepseek32b-decode-service:30001
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        ports:
+        - containerPort: 8000
+          protocol: TCP
+        readinessProbe:
+          periodSeconds: 30
+          tcpSocket:
+            port: 8000
+        resources:
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+
+      # 使用 affinity 选择匹配的机器
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: org
+                operator: In
+                values:
+                - "yiceai"
+              - key: yiceai
+                operator: In
+                values:
+                - "true"
+              - key: deploy
+                operator: In
+                values:
+                - "deepseekr1-32b-pd-p"
