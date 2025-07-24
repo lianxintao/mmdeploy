@@ -852,3 +852,42 @@ spec:
               topologyKey: kubernetes.io/hostname
       hostNetwork: true  # 使用宿主机网络
       dnsPolicy: Default
+
+
+#!/bin/bash
+
+set -e  # 遇到错误时退出脚本
+
+# 安装 git 和 git-lfs（适配 Debian/Ubuntu，其他系统需手动替换）
+if ! command -v git &> /dev/null; then
+    echo "安装 git..."
+    sudo apt-get update
+    sudo apt-get install -y git
+else
+    echo "git 已安装"
+fi
+
+if ! command -v git-lfs &> /dev/null; then
+    echo "安装 git-lfs..."
+    sudo apt-get install -y git-lfs
+else
+    echo "git-lfs 已安装"
+fi
+
+# 激活 git-lfs
+echo "激活 git-lfs..."
+git lfs install
+
+# 创建并进入目标目录
+mkdir -p ms-models
+cd ms-models
+
+# Clone 模型仓库
+echo "Cloning Qwen3-235B-A22B-Instruct-2507-FP8..."
+git clone https://www.modelscope.cn/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8.git
+
+echo "Cloning Qwen3-Coder-480B-A35B-Instruct-FP8..."
+git clone https://www.modelscope.cn/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8.git
+
+echo "所有操作完成！"
+
