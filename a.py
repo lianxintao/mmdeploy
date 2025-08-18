@@ -889,5 +889,13 @@ git clone https://www.modelscope.cn/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8.git
 echo "Cloning Qwen3-Coder-480B-A35B-Instruct-FP8..."
 git clone https://www.modelscope.cn/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8.git
 
+MOE
+https://pan.baidu.com/s/1gcjUMDz_vcmLS6yZAeH35Q?pwd=pbo8
+https://zhuanlan.zhihu.com/p/719466709
+https://triton.csdn.net/6719f57fcd8b2677c3d4ab94.html
+https://zhuanlan.zhihu.com/p/21251657579
+https://zhuanlan.zhihu.com/p/21251657579
+https://zhuanlan.zhihu.com/p/25401744621
+
 echo "所有操作完成！"
 
