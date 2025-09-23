@@ -907,3 +907,18 @@ https://blog.csdn.net/zpp13hao1/article/details/147891337
 https://mmssai.com/archives/33850
 echo "所有操作完成！"
 
+
+
+nvshmem
+https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/abstract.html
+https://zhuanlan.zhihu.com/p/26575363781
+https://blog.csdn.net/jkjgj/article/details/142066495
+https://zhuanlan.zhihu.com/p/1952325639211315297
+https://zhuanlan.zhihu.com/p/1941562551407187752
+https://zhuanlan.zhihu.com/p/1933899894881489690
+https://blog.csdn.net/jkjgj/article/details/142066495
+https://zhuanlan.zhihu.com/p/26082845081
+
+
+
+
