@@ -922,3 +922,81 @@ https://www.51cto.com/aigc/6550.html
 https://blog.csdn.net/gitblog_00341/article/details/151640319
 
 
+
+__device__ __forceinline__ float gelu(const float& val) {
+  constexpr float kAlpha = M_SQRT1_2;
+  return val * 0.5f * (1.0f + ::erf(val * kAlpha));
+}
+
+__device__ __forceinline__ float gelu_tanh(const float& val) {
+  const float cdf =
+      0.5f * (1.0f + math::tanh((0.7978845608028654f * (val + 0.044715f * val * val * val))));
+  return val * cdf;
+}
+
+void silu_and_mul(at::Tensor& out, at::Tensor& input, bool enable_pdl) {
+  int d = input.size(-1) / 2;
+  int64_t num_tokens = input.numel() / input.size(-1);
+
+  const c10::cuda::OptionalCUDAGuard device_guard(out.device());
+  auto stream = at::cuda::getCurrentCUDAStream();
+
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input.scalar_type(), c_type, [&] {
+    uint32_t vec_size = 16 / sizeof(c_type);
+    cudaLaunchConfig_t config;
+    config.gridDim = num_tokens;
+    config.blockDim = std::min(d / vec_size, 1024U);
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    auto kernel = flashinfer::activation::act_and_mul_kernel<c_type, silu>;
+
+    cudaLaunchKernelEx(&config, kernel, static_cast<c_type*>(out.data_ptr()),
+                       static_cast<c_type*>(input.data_ptr()), d);
+
+namespace activation {
+template <typename T, float (*Activation)(const float&)>
+__global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ input, const int d) {
+  constexpr uint32_t vec_size = 16 / sizeof(T);
+  const int64_t token_idx = blockIdx.x;
+  const int64_t thread_idx = threadIdx.x;
+  const int64_t stride = blockDim.x;
+  const int64_t offset = token_idx * 2 * d;
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+#pragma unroll 1
+  for (uint32_t idx = thread_idx; idx < d / vec_size; idx += stride) {
+    vec_t<float, vec_size> x_vec, y_vec, out_vec;
+    x_vec.cast_load(input + offset + idx * vec_size);
+    y_vec.cast_load(input + offset + d + idx * vec_size);
+#pragma unroll
+    for (uint32_t i = 0; i < vec_size; ++i) {
+      out_vec[i] = Activation(x_vec[i]) * y_vec[i];
+    }
+    out_vec.cast_store(out + token_idx * d + idx * vec_size);
+  }
+
+  const int64_t remaining_offset = d - d % (stride * vec_size);
+  // process the remaining elements
+#pragma unroll 1
+  for (int64_t idx = thread_idx; idx < d % (stride * vec_size); idx += stride) {
+    float x = input[offset + remaining_offset + idx],
+          y = input[offset + remaining_offset + d + idx];
+    out[token_idx * d + remaining_offset + idx] = Activation(x) * y;
+  }
+
+#if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
+
+
+
