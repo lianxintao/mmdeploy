@@ -2548,3 +2548,514 @@ def fused_experts_merge_impl(
             )
 
     return out_hidden_states
+
+
+// relu.cu
+// 完整实现：kernel + wrapper + C++ 测试 main()
+// 编译时需链接 libtorch（见 CMakeLists.txt）
+
+#include <iostream>
+#include <vector>
+#include <chrono>
+#include <stdexcept>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <torch/torch.h>
+
+// --- helpers/macros ---
+#define FLOAT4(value) (reinterpret_cast<float4 *>(&(value))[0])
+#define HALF2(value) (reinterpret_cast<half2 *>(&(value))[0])
+#define LDST128BITS(value) (reinterpret_cast<float4 *>(&(value))[0])
+
+inline void checkCudaError(const char *where) {
+  cudaError_t e = cudaGetLastError();
+  if (e != cudaSuccess) {
+    std::cerr << "CUDA Error after " << where << ": " << cudaGetErrorString(e) << std::endl;
+    throw std::runtime_error("CUDA kernel error");
+  }
+}
+
+inline void tensor_dtype_check(const torch::Tensor &T, torch::Dtype dt) {
+  if (T.dtype() != dt) {
+    std::cerr << "Tensor dtype mismatch. Expect: " << dt << ", got: " << T.dtype() << std::endl;
+    throw std::runtime_error("Tensor dtype mismatch");
+  }
+}
+
+// ------------------ kernels ------------------
+
+// FP32 scalar
+__global__ void relu_f32_kernel(float *x, float *y, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) y[idx] = fmaxf(0.0f, x[idx]);
+}
+
+// FP32 vectorized x4
+__global__ void relu_f32x4_kernel(float *x, float *y, int N) {
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (idx < N) {
+    float4 rx = FLOAT4(x[idx]);
+    float4 ry;
+    ry.x = fmaxf(0.0f, rx.x);
+    ry.y = fmaxf(0.0f, rx.y);
+    ry.z = fmaxf(0.0f, rx.z);
+    ry.w = fmaxf(0.0f, rx.w);
+    FLOAT4(y[idx]) = ry;
+  }
+}
+
+// FP16 scalar
+__global__ void relu_f16_kernel(half *x, half *y, int N) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < N) y[idx] = __hmax(__float2half(0.0f), x[idx]);
+}
+
+// FP16 x2 (half2)
+__global__ void relu_f16x2_kernel(half *x, half *y, int N) {
+  int idx = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx < N) {
+    half2 rx = HALF2(x[idx]);
+    half2 ry = HALF2(y[idx]);
+    ry.x = __hmax(__float2half(0.0f), rx.x);
+    ry.y = __hmax(__float2half(0.0f), rx.y);
+    HALF2(y[idx]) = ry;
+  }
+}
+
+// FP16 x8 (we read as 4 half2)
+__global__ void relu_f16x8_kernel(half *x, half *y, int N) {
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx >= N) return;
+  // safe loads with boundary checks on store
+  half2 rx0 = HALF2(x[idx + 0]);
+  half2 rx1 = HALF2(x[idx + 2]);
+  half2 rx2 = HALF2(x[idx + 4]);
+  half2 rx3 = HALF2(x[idx + 6]);
+  half2 ry0, ry1, ry2, ry3;
+  ry0.x = __hmax(__float2half(0.0f), rx0.x);
+  ry0.y = __hmax(__float2half(0.0f), rx0.y);
+  ry1.x = __hmax(__float2half(0.0f), rx1.x);
+  ry1.y = __hmax(__float2half(0.0f), rx1.y);
+  ry2.x = __hmax(__float2half(0.0f), rx2.x);
+  ry2.y = __hmax(__float2half(0.0f), rx2.y);
+  ry3.x = __hmax(__float2half(0.0f), rx3.x);
+  ry3.y = __hmax(__float2half(0.0f), rx3.y);
+  if ((idx + 0) < N) HALF2(y[idx + 0]) = ry0;
+  if ((idx + 2) < N) HALF2(y[idx + 2]) = ry1;
+  if ((idx + 4) < N) HALF2(y[idx + 4]) = ry2;
+  if ((idx + 6) < N) HALF2(y[idx + 6]) = ry3;
+}
+
+// FP16 x8 pack - load 128 bits and operate
+__global__ void relu_f16x8_pack_kernel(half *x, half *y, int N) {
+  int idx = 8 * (blockIdx.x * blockDim.x + threadIdx.x);
+  if (idx >= N) return;
+  const half2 z2 = {__float2half(0.0f), __float2half(0.0f)};
+  half pack_x[8];
+  half pack_y[8];
+  LDST128BITS(pack_x[0]) = LDST128BITS(x[idx]); // 128-bit load (may overread, ensure safe store)
+#pragma unroll
+  for (int i = 0; i < 8; i += 2) {
+    HALF2(pack_y[i]) = __hmax2(HALF2(pack_x[i]), z2);
+  }
+  if ((idx + 7) < N) {
+    LDST128BITS(y[idx]) = LDST128BITS(pack_y[0]);
+  } else {
+    for (int i = 0; i < 8; ++i) {
+      if (idx + i < N) y[idx + i] = pack_y[i];
+    }
+  }
+}
+
+// ------------------ host wrappers ------------------
+
+void relu_f32(torch::Tensor x, torch::Tensor y) {
+  tensor_dtype_check(x, torch::kFloat32);
+  tensor_dtype_check(y, torch::kFloat32);
+  int ndim = x.dim();
+  if (ndim != 2) {
+    int64_t N = 1;
+    for (int i = 0; i < ndim; ++i) N *= x.size(i);
+    dim3 block(256 / 1);
+    dim3 grid((N + 256 - 1) / 256);
+    relu_f32_kernel<<<grid, block>>>(
+        reinterpret_cast<float *>(x.data_ptr()),
+        reinterpret_cast<float *>(y.data_ptr()), (int)N);
+  } else {
+    const int S = x.size(0);
+    const int K = x.size(1);
+    const int N = S * K;
+    if ((K / 1) <= 1024) {
+      dim3 block(K / 1);
+      dim3 grid(S);
+      relu_f32_kernel<<<grid, block>>>(
+          reinterpret_cast<float *>(x.data_ptr()),
+          reinterpret_cast<float *>(y.data_ptr()), N);
+    } else {
+      dim3 block(256 / 1);
+      dim3 grid((N + 256 - 1) / 256);
+      relu_f32_kernel<<<grid, block>>>(
+          reinterpret_cast<float *>(x.data_ptr()),
+          reinterpret_cast<float *>(y.data_ptr()), N);
+    }
+  }
+  checkCudaError("relu_f32 launch");
+}
+
+void relu_f32x4(torch::Tensor x, torch::Tensor y) {
+  tensor_dtype_check(x, torch::kFloat32);
+  tensor_dtype_check(y, torch::kFloat32);
+  int ndim = x.dim();
+  const int n_elements = 4;
+  if (ndim != 2) {
+    int64_t N = 1;
+    for (int i = 0; i < ndim; ++i) N *= x.size(i);
+    dim3 block(256 / n_elements);
+    dim3 grid((N + 256 - 1) / 256);
+    relu_f32x4_kernel<<<grid, block>>>(
+        reinterpret_cast<float *>(x.data_ptr()),
+        reinterpret_cast<float *>(y.data_ptr()), (int)N);
+  } else {
+    const int S = x.size(0);
+    const int K = x.size(1);
+    const int N = S * K;
+    if ((K / n_elements) <= 1024) {
+      dim3 block(K / n_elements);
+      dim3 grid(S);
+      relu_f32x4_kernel<<<grid, block>>>(
+          reinterpret_cast<float *>(x.data_ptr()),
+          reinterpret_cast<float *>(y.data_ptr()), N);
+    } else {
+      dim3 block(256 / n_elements);
+      dim3 grid((N + 256 - 1) / 256);
+      relu_f32x4_kernel<<<grid, block>>>(
+          reinterpret_cast<float *>(x.data_ptr()),
+          reinterpret_cast<float *>(y.data_ptr()), N);
+    }
+  }
+  checkCudaError("relu_f32x4 launch");
+}
+
+void relu_f16(torch::Tensor x, torch::Tensor y) {
+  tensor_dtype_check(x, torch::kFloat16);
+  tensor_dtype_check(y, torch::kFloat16);
+  int ndim = x.dim();
+  if (ndim != 2) {
+    int64_t N = 1;
+    for (int i = 0; i < ndim; ++i) N *= x.size(i);
+    dim3 block(256 / 1);
+    dim3 grid((N + 256 - 1) / 256);
+    relu_f16_kernel<<<grid, block>>>(
+        reinterpret_cast<half *>(x.data_ptr()),
+        reinterpret_cast<half *>(y.data_ptr()), (int)N);
+  } else {
+    const int S = x.size(0);
+    const int K = x.size(1);
+    const int N = S * K;
+    if ((K / 1) <= 1024) {
+      dim3 block(K / 1);
+      dim3 grid(S);
+      relu_f16_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    } else {
+      dim3 block(256 / 1);
+      dim3 grid((N + 256 - 1) / 256);
+      relu_f16_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    }
+  }
+  checkCudaError("relu_f16 launch");
+}
+
+void relu_f16x2(torch::Tensor x, torch::Tensor y) {
+  tensor_dtype_check(x, torch::kFloat16);
+  tensor_dtype_check(y, torch::kFloat16);
+  int ndim = x.dim();
+  const int n_elements = 2;
+  if (ndim != 2) {
+    int64_t N = 1;
+    for (int i = 0; i < ndim; ++i) N *= x.size(i);
+    dim3 block(256 / n_elements);
+    dim3 grid((N + 256 - 1) / 256);
+    relu_f16x2_kernel<<<grid, block>>>(
+        reinterpret_cast<half *>(x.data_ptr()),
+        reinterpret_cast<half *>(y.data_ptr()), (int)N);
+  } else {
+    const int S = x.size(0);
+    const int K = x.size(1);
+    const int N = S * K;
+    if ((K / n_elements) <= 1024) {
+      dim3 block(K / n_elements);
+      dim3 grid(S);
+      relu_f16x2_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    } else {
+      dim3 block(256 / n_elements);
+      dim3 grid((N + 256 - 1) / 256);
+      relu_f16x2_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    }
+  }
+  checkCudaError("relu_f16x2 launch");
+}
+
+void relu_f16x8(torch::Tensor x, torch::Tensor y) {
+  tensor_dtype_check(x, torch::kFloat16);
+  tensor_dtype_check(y, torch::kFloat16);
+  const int n_elements = 8;
+  int ndim = x.dim();
+  if (ndim != 2) {
+    int64_t N = 1;
+    for (int i = 0; i < ndim; ++i) N *= x.size(i);
+    dim3 block(256 / n_elements);
+    dim3 grid((N + 256 - 1) / 256);
+    relu_f16x8_kernel<<<grid, block>>>(
+        reinterpret_cast<half *>(x.data_ptr()),
+        reinterpret_cast<half *>(y.data_ptr()), (int)N);
+  } else {
+    const int S = x.size(0);
+    const int K = x.size(1);
+    const int N = S * K;
+    if ((K / n_elements) <= 1024) {
+      dim3 block(K / n_elements);
+      dim3 grid(S);
+      relu_f16x8_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    } else {
+      dim3 block(256 / n_elements);
+      dim3 grid((N + 256 - 1) / 256);
+      relu_f16x8_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    }
+  }
+  checkCudaError("relu_f16x8 launch");
+}
+
+void relu_f16x8_pack(torch::Tensor x, torch::Tensor y) {
+  tensor_dtype_check(x, torch::kFloat16);
+  tensor_dtype_check(y, torch::kFloat16);
+  const int n_elements = 8;
+  int ndim = x.dim();
+  if (ndim != 2) {
+    int64_t N = 1;
+    for (int i = 0; i < ndim; ++i) N *= x.size(i);
+    dim3 block(256 / n_elements);
+    dim3 grid((N + 256 - 1) / 256);
+    relu_f16x8_pack_kernel<<<grid, block>>>(
+        reinterpret_cast<half *>(x.data_ptr()),
+        reinterpret_cast<half *>(y.data_ptr()), (int)N);
+  } else {
+    const int S = x.size(0);
+    const int K = x.size(1);
+    const int N = S * K;
+    if ((K / n_elements) <= 1024) {
+      dim3 block(K / n_elements);
+      dim3 grid(S);
+      relu_f16x8_pack_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    } else {
+      dim3 block(256 / n_elements);
+      dim3 grid((N + 256 - 1) / 256);
+      relu_f16x8_pack_kernel<<<grid, block>>>(
+          reinterpret_cast<half *>(x.data_ptr()),
+          reinterpret_cast<half *>(y.data_ptr()), N);
+    }
+  }
+  checkCudaError("relu_f16x8_pack launch");
+}
+
+// ------------------ benchmark / verify helpers ------------------
+
+template <typename Func>
+double run_benchmark(Func func, torch::Tensor &x, torch::Tensor &out,
+                     const std::string &tag, int warmup = 10, int iters = 200) {
+  out.zero_();
+  for (int i = 0; i < warmup; ++i) func(x, out);
+  cudaDeviceSynchronize();
+
+  auto t0 = std::chrono::high_resolution_clock::now();
+  for (int i = 0; i < iters; ++i) func(x, out);
+  cudaDeviceSynchronize();
+  auto t1 = std::chrono::high_resolution_clock::now();
+
+  double ms_total = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  double mean = ms_total / iters;
+  std::cout << tag << ": mean time = " << mean << " ms" << std::endl;
+  return mean;
+}
+
+bool verify_equal(const torch::Tensor &a, const torch::Tensor &b, double rtol = 1e-3, double atol = 1e-3) {
+  // compare on CPU with float32 precision
+  auto a_cpu = a.detach().to(torch::kFloat32).cpu();
+  auto b_cpu = b.detach().to(torch::kFloat32).cpu();
+  bool ok = torch::allclose(a_cpu, b_cpu, rtol, atol);
+  if (!ok) {
+    torch::Tensor max_tensor = (a_cpu - b_cpu).abs().max();
+    torch::Scalar max_scalar = max_tensor.item();
+    float diff = max_scalar.toFloat();
+    std::cout << "Max abs diff = " << diff << std::endl;
+  }
+  return ok;
+}
+
+// ------------------ main: 按 python 脚本逻辑跑 SxK 的组合 ------------------
+
+int main(int argc, char **argv) {
+  torch::manual_seed(123);
+  if (!torch::cuda::is_available()) {
+    std::cerr << "No CUDA device available. Exiting." << std::endl;
+    return 1;
+  }
+  std::vector<int> Ss = {1024, 2048, 4096};
+  std::vector<int> Ks = {1024, 2048, 4096};
+
+  for (int S : Ss) {
+    for (int K : Ks) {
+      std::cout << "--------------------------------------------------------\n";
+      std::cout << " S=" << S << ", K=" << K << std::endl;
+      auto opts_f32 = torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32).requires_grad(false);
+      auto x = torch::randn({S, K}, opts_f32).contiguous();
+      auto y = torch::zeros_like(x);
+
+      // f32
+      run_benchmark(relu_f32, x, y, "f32");
+      // f32x4
+      run_benchmark(relu_f32x4, x, y, "f32x4");
+      // torch.relu reference
+      double t_ref = 0;
+      {
+        auto out_ref = torch::zeros_like(x);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < 10; ++i) out_ref = torch::relu(x);
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        t_ref = std::chrono::duration<double, std::milli>(t1 - t0).count() / 10.0;
+        std::cout << "f32_th: mean time (approx) = " << t_ref << " ms" << std::endl;
+      }
+
+      // verify correctness for f32 variants
+      {
+        auto y_test = torch::zeros_like(x);
+        relu_f32(x, y_test);
+        auto ref = torch::relu(x);
+        std::cout << "  f32 equal: " << (verify_equal(y_test, ref) ? "OK" : "FAIL") << std::endl;
+      }
+      {
+        auto y_test = torch::zeros_like(x);
+        relu_f32x4(x, y_test);
+        auto ref = torch::relu(x);
+        std::cout << "  f32x4 equal: " << (verify_equal(y_test, ref) ? "OK" : "FAIL") << std::endl;
+      }
+
+      std::cout << "--------------------------------------------------------\n";
+      // f16 tests
+      auto x_f16 = x.to(torch::kFloat16).contiguous();
+      auto y_f16 = torch::zeros_like(x_f16);
+
+      run_benchmark(relu_f16, x_f16, y_f16, "f16");
+      run_benchmark(relu_f16x2, x_f16, y_f16, "f16x2");
+      run_benchmark(relu_f16x8, x_f16, y_f16, "f16x8");
+      run_benchmark(relu_f16x8_pack, x_f16, y_f16, "f16x8_pack");
+
+      // torch.relu on half (approx)
+      {
+        auto out_ref = torch::zeros_like(x_f16);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < 10; ++i) out_ref = torch::relu(x_f16);
+        cudaDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double tref = std::chrono::duration<double, std::milli>(t1 - t0).count() / 10.0;
+        std::cout << "f16_th: mean time (approx) = " << tref << " ms" << std::endl;
+      }
+
+      // correctness check for f16
+      {
+        auto y_test = torch::zeros_like(x_f16);
+        relu_f16(x_f16, y_test);
+        auto ref = torch::relu(x_f16);
+        std::cout << "  f16 equal: " << (verify_equal(y_test, ref) ? "OK" : "FAIL") << std::endl;
+      }
+      {
+        auto y_test = torch::zeros_like(x_f16);
+        relu_f16x2(x_f16, y_test);
+        auto ref = torch::relu(x_f16);
+        std::cout << "  f16x2 equal: " << (verify_equal(y_test, ref) ? "OK" : "FAIL") << std::endl;
+      }
+      {
+        auto y_test = torch::zeros_like(x_f16);
+        relu_f16x8(x_f16, y_test);
+        auto ref = torch::relu(x_f16);
+        std::cout << "  f16x8 equal: " << (verify_equal(y_test, ref) ? "OK" : "FAIL") << std::endl;
+      }
+      {
+        auto y_test = torch::zeros_like(x_f16);
+        relu_f16x8_pack(x_f16, y_test);
+        auto ref = torch::relu(x_f16);
+        std::cout << "  f16x8_pack equal: " << (verify_equal(y_test, ref) ? "OK" : "FAIL") << std::endl;
+      }
+      std::cout << std::endl;
+    }
+  }
+  std::cout << "All tests finished." << std::endl;
+  return 0;
+}
+
+
+
+
+
+cmake_minimum_required(VERSION 3.18)
+project(relu_cuda LANGUAGES CXX CUDA)
+set(CMAKE_CUDA_ARCHITECTURES 86)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -g -G")
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# 要求用户在 cmake 命令中提供 Torch 的 cmake 路径：
+# -DCMAKE_PREFIX_PATH="$(python3 -c 'import torch;print(torch.utils.cmake_prefix_path)')"
+find_package(Torch REQUIRED)
+
+# 在 Debug 模式下为 nvcc 添加 -G 用于 device-side debug
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(STATUS "Building Debug: enabling device debug flags (-G) for CUDA")
+    set(CUDA_NVCC_FLAGS_DEBUG "${CUDA_NVCC_FLAGS_DEBUG} -G -g -lineinfo")
+endif()
+
+add_executable(relu_test relu.cu)
+
+# CUDA compile flags
+target_compile_options(relu_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr
+        --expt-extended-lambda
+        -Xcompiler=-fPIC
+        -use_fast_math
+        >
+)
+
+# Host compile options
+target_compile_options(relu_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:
+        -O3
+        >
+)
+
+target_include_directories(relu_test PRIVATE ${TORCH_INCLUDE_DIRS})
+target_link_libraries(relu_test PRIVATE "${TORCH_LIBRARIES}")
+
+# RPATH so executable can find libtorch if needed
+set_target_properties(relu_test PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN"
+)
+
