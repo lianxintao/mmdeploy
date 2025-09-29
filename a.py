@@ -997,6 +997,23 @@ __global__ void act_and_mul_kernel(T* __restrict__ out, const T* __restrict__ in
 #endif
 }
 
+#include <algorithm>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <float.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <torch/extension.h>
+#include <torch/types.h>
+#include <vector>
 
-
+__device__ __forceinline__ __nv_bfloat162 silu_mul_half2(const __nv_bfloat162& val, const __nv_bfloat162& factor ) {
+      return __hmul2(__h2div(val, __hadd2(__float2bfloat162_rn(1.0f), h2exp(__hneg2(val)))), factor);
+}
+__global__ void act_mul_f32_kernel(float* __restrict__ out, const float* __restrict__ input, const int d) {
+        const int64_t vec_size = 4;
+    const int64_t token_idx = blockIdx.x;
+    const int64_t thread_idx = threadIdx.x;
+    const int64_t stride = blockDim.x;
+    const int64_t offset = token_idx * 2 * d;
 
