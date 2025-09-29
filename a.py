@@ -1017,3 +1017,8 @@ __global__ void act_mul_f32_kernel(float* __restrict__ out, const float* __restr
     const int64_t stride = blockDim.x;
     const int64_t offset = token_idx * 2 * d;
 
+    cudaDeviceSynchronize(); 
+    cudaError_t err = cudaGetLastError(); 
+    if (err != cudaSuccess) { 
+        printf("CUDA Error: %s\n",cudaGetErrorString(err)); 
+    }
