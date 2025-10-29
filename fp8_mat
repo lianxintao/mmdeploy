@@ -1,0 +1,560 @@
+import unittest
+import time
+
+import torch
+from sglang.srt.layers.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    w8a8_block_fp8_matmul,
+)
+from torch.utils.cpp_extension import load_inline
+
+# CUDA kernel source code for block-wise FP8 matmul
+cuda_source = '''
+#include <torch/extension.h>
+#include <cuda_fp8.h>
+#include <cuda_runtime.h>
+
+// Optimized Block-wise FP8 GEMM kernel with shared memory tiling
+// C[M, N] = A[M, K] @ B[K, N]  (with scales As[M, K//group_k] and Bs[K//group_k, N//group_n])
+template<int BLOCK_M, int BLOCK_N, int BLOCK_K, int THREAD_M, int THREAD_N>
+__global__ void w8a8_block_fp8_matmul_kernel(
+    const __nv_fp8_e4m3* __restrict__ A,
+    const __nv_fp8_e4m3* __restrict__ B,
+    const float* __restrict__ As,
+    const float* __restrict__ Bs,
+    void* __restrict__ C,
+    int M, int N, int K,
+    int group_n, int group_k,
+    int output_dtype
+) {
+    // Shared memory for A and B tiles - pad to avoid bank conflicts
+    __shared__ __nv_fp8_e4m3 smem_A[BLOCK_M][BLOCK_K + 8];
+    __shared__ __nv_fp8_e4m3 smem_B[BLOCK_K][BLOCK_N + 8];
+
+    // Thread and block indices
+    const int tid = threadIdx.x;
+    const int block_m = blockIdx.y;
+    const int block_n = blockIdx.x;
+    const int m_start = block_m * BLOCK_M;
+    const int n_start = block_n * BLOCK_N;
+
+    // Number of threads per block
+    constexpr int NUM_THREADS = (BLOCK_M * BLOCK_N) / (THREAD_M * THREAD_N);
+
+    // Thread's position in the output tile
+    const int thread_m = (tid / (BLOCK_N / THREAD_N)) * THREAD_M;
+    const int thread_n = (tid % (BLOCK_N / THREAD_N)) * THREAD_N;
+
+    // Accumulators for each thread's output elements
+    float accum[THREAD_M][THREAD_N];
+    #pragma unroll
+    for (int i = 0; i < THREAD_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < THREAD_N; ++j) {
+            accum[i][j] = 0.0f;
+        }
+    }
+
+    // Loop over K dimension in tiles
+    for (int k_tile = 0; k_tile < K; k_tile += BLOCK_K) {
+
+        // Load A tile to shared memory (coalesced)
+        for (int i = tid; i < BLOCK_M * BLOCK_K; i += NUM_THREADS) {
+            int m_local = i / BLOCK_K;
+            int k_local = i % BLOCK_K;
+            int m_global = m_start + m_local;
+            int k_global = k_tile + k_local;
+
+            if (m_global < M && k_global < K) {
+                smem_A[m_local][k_local] = A[m_global * K + k_global];
+            } else {
+                smem_A[m_local][k_local] = __nv_fp8_e4m3(0.0f);
+            }
+        }
+
+        // Load B tile to shared memory (coalesced)
+        for (int i = tid; i < BLOCK_K * BLOCK_N; i += NUM_THREADS) {
+            int k_local = i / BLOCK_N;
+            int n_local = i % BLOCK_N;
+            int k_global = k_tile + k_local;
+            int n_global = n_start + n_local;
+
+            if (k_global < K && n_global < N) {
+                smem_B[k_local][n_local] = B[k_global * N + n_global];
+            } else {
+                smem_B[k_local][n_local] = __nv_fp8_e4m3(0.0f);
+            }
+        }
+
+        __syncthreads();
+
+        // Compute on the tile with immediate scaling (like Triton)
+        // Determine which scale block this K tile belongs to
+        int k_scale_idx = k_tile / group_k;
+
+        // Load scales for this thread's output elements
+        float a_scales[THREAD_M];
+        float b_scales[THREAD_N];
+
+        #pragma unroll
+        for (int i = 0; i < THREAD_M; ++i) {
+            int m = m_start + thread_m + i;
+            if (m < M) {
+                a_scales[i] = As[m * (K / group_k) + k_scale_idx];
+            }
+        }
+
+        #pragma unroll
+        for (int j = 0; j < THREAD_N; ++j) {
+            int n = n_start + thread_n + j;
+            if (n < N) {
+                b_scales[j] = Bs[k_scale_idx * (N / group_n) + (n / group_n)];
+            }
+        }
+
+        // Compute with immediate scaling
+        #pragma unroll
+        for (int k = 0; k < BLOCK_K; ++k) {
+            if (k_tile + k < K) {
+                #pragma unroll
+                for (int i = 0; i < THREAD_M; ++i) {
+                    float a_val = float(smem_A[thread_m + i][k]) * a_scales[i];
+                    #pragma unroll
+                    for (int j = 0; j < THREAD_N; ++j) {
+                        float b_val = float(smem_B[k][thread_n + j]) * b_scales[j];
+                        accum[i][j] += a_val * b_val;
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write output
+    #pragma unroll
+    for (int i = 0; i < THREAD_M; ++i) {
+        #pragma unroll
+        for (int j = 0; j < THREAD_N; ++j) {
+            int m = m_start + thread_m + i;
+            int n = n_start + thread_n + j;
+
+            if (m < M && n < N) {
+                int out_idx = m * N + n;
+                if (output_dtype == 0) {
+                    reinterpret_cast<__half*>(C)[out_idx] = __float2half(accum[i][j]);
+                } else if (output_dtype == 1) {
+                    reinterpret_cast<__nv_bfloat16*>(C)[out_idx] = __float2bfloat16(accum[i][j]);
+                } else {
+                    reinterpret_cast<float*>(C)[out_idx] = accum[i][j];
+                }
+            }
+        }
+    }
+}
+
+// Host wrapper function
+torch::Tensor w8a8_block_fp8_matmul_cuda(
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor As,
+    torch::Tensor Bs,
+    int block_m,
+    int block_n,
+    int group_n,
+    int group_k,
+    torch::Dtype output_dtype
+) {
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+
+    // Create output tensor
+    auto options = torch::TensorOptions().device(A.device()).dtype(output_dtype);
+    auto C = torch::empty({M, N}, options);
+
+    // Determine dtype index
+    int dtype_idx = 2;  // float32
+    if (output_dtype == torch::kFloat16) dtype_idx = 0;
+    else if (output_dtype == torch::kBFloat16) dtype_idx = 1;
+
+    // Optimized launch configuration - larger tiles for better performance
+    constexpr int BLOCK_M = 128;
+    constexpr int BLOCK_N = 128;
+    constexpr int BLOCK_K = 64;
+    constexpr int THREAD_M = 8;
+    constexpr int THREAD_N = 8;
+    constexpr int NUM_THREADS = (BLOCK_M * BLOCK_N) / (THREAD_M * THREAD_N);
+
+    dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
+    dim3 block(NUM_THREADS);
+
+    w8a8_block_fp8_matmul_kernel<BLOCK_M, BLOCK_N, BLOCK_K, THREAD_M, THREAD_N><<<grid, block>>>(
+        reinterpret_cast<const __nv_fp8_e4m3*>(A.data_ptr()),
+        reinterpret_cast<const __nv_fp8_e4m3*>(B.data_ptr()),
+        As.data_ptr<float>(),
+        Bs.data_ptr<float>(),
+        C.data_ptr(),
+        M, N, K,
+        group_n, group_k,
+        dtype_idx
+    );
+
+    return C;
+}
+'''
+
+cpp_source = '''
+torch::Tensor w8a8_block_fp8_matmul_cuda(
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor As,
+    torch::Tensor Bs,
+    int block_m,
+    int block_n,
+    int group_n,
+    int group_k,
+    torch::Dtype output_dtype
+);
+'''
+
+# Helper function to compile and load the CUDA extension
+def get_cuda_extension():
+    try:
+        cuda_module = load_inline(
+            name='w8a8_block_fp8_cuda',
+            cpp_sources=[cpp_source],
+            cuda_sources=[cuda_source],
+            functions=['w8a8_block_fp8_matmul_cuda'],
+            extra_cuda_cflags=['-O3', '--use_fast_math'],
+            verbose=False,
+        )
+        return cuda_module
+    except Exception as e:
+        print(f"Warning: Failed to compile CUDA extension: {e}")
+        return None
+
+# Wrapper function for the CUDA kernel
+def w8a8_block_fp8_cuda_matmul(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    block_size: list,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """CUDA implementation of block-wise FP8 matmul
+
+    Args:
+        A: Input tensor [M, K] in FP8
+        B: Weight tensor [K, N] in FP8 (transposed)
+        As: Scales for A [M, K//group_k]
+        Bs: Scales for B [K//group_k, N//group_n] (transposed)
+        block_size: [block_n, block_k] for quantization blocks
+        output_dtype: Output data type
+
+    Returns:
+        C: Output tensor [M, N]
+    """
+    cuda_module = get_cuda_extension()
+    if cuda_module is None:
+        raise RuntimeError("CUDA extension compilation failed")
+
+    block_n, block_k = block_size
+    M = A.shape[0]
+    K = A.shape[1]
+    N = B.shape[1]  # B is transposed, so N is the second dimension
+
+    # Call CUDA kernel
+    C = cuda_module.w8a8_block_fp8_matmul_cuda(
+        A.contiguous(),
+        B.contiguous(),
+        As.contiguous(),
+        Bs.contiguous(),
+        16,  # block_m
+        16,  # block_n
+        block_n,
+        block_k,
+        output_dtype
+    )
+
+    return C
+
+
+class TestFP8Base():
+    def __init__(cls):
+        cls.M = 256
+        # test non-aligned
+        cls.N = 1536
+        cls.K = 4096
+        cls.group_size = 128
+        cls.quant_type = torch.float8_e4m3fn
+        cls.output_type = torch.bfloat16
+
+    @staticmethod
+    def _make_A(M, K, group_size, out_dtype):
+        quant_A = torch.rand(
+            M, K // group_size, group_size, dtype=torch.float32, device="cuda"
+        )
+        # -1 ~ 1
+        quant_A = quant_A * 2 - 1
+        # scaling abs max to fmax
+        finfo = torch.finfo(out_dtype)
+        fmax = finfo.max
+        scaling = fmax / quant_A.abs().amax(-1, keepdim=True)
+        quant_A *= scaling
+        quant_A = quant_A.to(out_dtype).to(torch.float32)
+
+        # create scale and A
+        scale = torch.rand(M, K // group_size, dtype=torch.float32, device="cuda")
+        scale /= fmax
+        A = quant_A * scale[..., None]
+
+        A = A.reshape(M, K)
+        quant_A = quant_A.reshape(M, K).to(out_dtype)
+        return A, quant_A, scale
+
+    @staticmethod
+    def _make_B(K, N, group_size, out_dtype):
+        def _aligned_size(a, b):
+            return (a + b - 1) // b * b
+
+        K_aligned = _aligned_size(K, group_size)
+        N_aligned = _aligned_size(N, group_size)
+
+        quant_B = torch.rand(
+            K_aligned // group_size,
+            group_size,
+            N_aligned // group_size,
+            group_size,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        quant_B = quant_B * 2 - 1
+
+        # scaling abs max to fmax
+        finfo = torch.finfo(out_dtype)
+        fmax = finfo.max
+        scaling = fmax / quant_B.abs().amax((1, 3), keepdim=True)
+        quant_B *= scaling
+        quant_B = quant_B.to(out_dtype).to(torch.float32)
+
+        scale = torch.rand(
+            K_aligned // group_size,
+            1,
+            N_aligned // group_size,
+            1,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        scale /= fmax
+
+        B = quant_B * scale
+
+        B = B.reshape(K_aligned, N_aligned)[:K, :N]
+        quant_B = quant_B.reshape(K_aligned, N_aligned).to(out_dtype)[:K, :N]
+        scale = scale.reshape(K_aligned // group_size, N_aligned // group_size)
+        return B, quant_B, scale
+
+
+# class TestPerTokenGroupQuantFP8(TestFP8Base):
+    def test_per_token_group_quant_fp8(self):
+        if torch.cuda.get_device_capability()[0] < 9:
+            return
+        A, A_quant_gt, scale_gt = self._make_A(
+            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+        )
+        A_quant, scale = per_token_group_quant_fp8(x=A, group_size=self.group_size)
+        torch.testing.assert_close(scale, scale_gt)
+        diff = (A_quant.to(torch.float16) - A_quant_gt.to(torch.float16)).abs()
+        diff_count = (diff > 1e-5).count_nonzero()
+        assert diff_count / diff.numel() < 1e-4
+
+
+# class TestW8A8BlockFP8Matmul(TestFP8Base):
+    def test_w8a8_block_fp8_matmul(self):
+        if torch.cuda.get_device_capability()[0] < 9:
+            return
+        A, A_quant_gt, A_scale_gt = self._make_A(
+            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+        )
+        B, B_quant_gt, B_scale_gt = self._make_B(
+            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
+        )
+        C_gt = A.to(self.output_type) @ B.to(self.output_type)
+        C = w8a8_block_fp8_matmul(
+            A=A_quant_gt,
+            B=B_quant_gt.T.contiguous(),
+            As=A_scale_gt,
+            Bs=B_scale_gt.T.contiguous(),
+            block_size=[128, 128],
+            output_dtype=self.output_type,
+        )
+        torch.testing.assert_close(C, C_gt, atol=0.5, rtol=1e-4)
+
+    def test_w8a8_block_fp8_cuda_matmul(self):
+        """Test CUDA kernel implementation of block-wise FP8 matmul"""
+        if torch.cuda.get_device_capability()[0] < 9:
+            print("Skipping CUDA FP8 test: requires compute capability >= 9.0")
+            return
+
+        # Skip test if CUDA extension compilation fails
+        try:
+            cuda_module = get_cuda_extension()
+            if cuda_module is None:
+                print("Skipping CUDA FP8 test: extension compilation failed")
+                return
+        except Exception as e:
+            print(f"Skipping CUDA FP8 test: {e}")
+            return
+
+        # Prepare test data
+        A, A_quant_gt, A_scale_gt = self._make_A(
+            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+        )
+        B, B_quant_gt, B_scale_gt = self._make_B(
+            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
+        )
+
+        # Ground truth: compute with full precision
+        C_gt = A.to(self.output_type) @ B.to(self.output_type)
+
+        # Test CUDA kernel
+        C_cuda = w8a8_block_fp8_cuda_matmul(
+            A=A_quant_gt,
+            B=B_quant_gt.contiguous(),
+            As=A_scale_gt,
+            Bs=B_scale_gt.contiguous(),
+            block_size=[128, 128],
+            output_dtype=self.output_type,
+        )
+
+        # Compare CUDA result with ground truth
+        torch.testing.assert_close(C_cuda, C_gt, atol=0.5, rtol=1e-4)
+
+        # Also compare with Triton implementation
+        C_triton = w8a8_block_fp8_matmul(
+            A=A_quant_gt,
+            B=B_quant_gt.T.contiguous(),
+            As=A_scale_gt,
+            Bs=B_scale_gt.T.contiguous(),
+            block_size=[128, 128],
+            output_dtype=self.output_type,
+        )
+
+        # CUDA and Triton should produce similar results
+        torch.testing.assert_close(C_cuda, C_triton, atol=0.15, rtol=1e-2)
+
+    def test_performance_comparison(self):
+        """Performance comparison between ground truth, Triton and CUDA implementations"""
+        if torch.cuda.get_device_capability()[0] < 9:
+            print("Skipping performance test: requires compute capability >= 9.0")
+            return
+
+        # Skip test if CUDA extension compilation fails
+        try:
+            cuda_module = get_cuda_extension()
+            if cuda_module is None:
+                print("Skipping performance test: CUDA extension compilation failed")
+                return
+        except Exception as e:
+            print(f"Skipping performance test: {e}")
+            return
+
+        # Prepare test data
+        A, A_quant_gt, A_scale_gt = self._make_A(
+            M=self.M, K=self.K, group_size=self.group_size, out_dtype=self.quant_type
+        )
+        B, B_quant_gt, B_scale_gt = self._make_B(
+            K=self.K, N=self.N, group_size=self.group_size, out_dtype=self.quant_type
+        )
+
+        # Warmup
+        for _ in range(10):
+            _ = A.to(self.output_type) @ B.to(self.output_type)
+        torch.cuda.synchronize()
+
+        # Benchmark ground truth (full precision matmul)
+        num_runs = 100
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(num_runs):
+            C_gt = A.to(self.output_type) @ B.to(self.output_type)
+        torch.cuda.synchronize()
+        gt_time = (time.perf_counter() - start) / num_runs * 1000  # ms
+
+        # Warmup Triton
+        for _ in range(10):
+            _ = w8a8_block_fp8_matmul(
+                A=A_quant_gt,
+                B=B_quant_gt.T.contiguous(),
+                As=A_scale_gt,
+                Bs=B_scale_gt.T.contiguous(),
+                block_size=[128, 128],
+                output_dtype=self.output_type,
+            )
+        torch.cuda.synchronize()
+
+        # Benchmark Triton implementation
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(num_runs):
+            C_triton = w8a8_block_fp8_matmul(
+                A=A_quant_gt,
+                B=B_quant_gt.T.contiguous(),
+                As=A_scale_gt,
+                Bs=B_scale_gt.T.contiguous(),
+                block_size=[128, 128],
+                output_dtype=self.output_type,
+            )
+        torch.cuda.synchronize()
+        triton_time = (time.perf_counter() - start) / num_runs * 1000  # ms
+
+        # Warmup CUDA
+        for _ in range(10):
+            _ = w8a8_block_fp8_cuda_matmul(
+                A=A_quant_gt,
+                B=B_quant_gt.contiguous(),
+                As=A_scale_gt,
+                Bs=B_scale_gt.contiguous(),
+                block_size=[128, 128],
+                output_dtype=self.output_type,
+            )
+        torch.cuda.synchronize()
+
+        # Benchmark CUDA implementation
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        for _ in range(num_runs):
+            C_cuda = w8a8_block_fp8_cuda_matmul(
+                A=A_quant_gt,
+                B=B_quant_gt.contiguous(),
+                As=A_scale_gt,
+                Bs=B_scale_gt.contiguous(),
+                block_size=[128, 128],
+                output_dtype=self.output_type,
+            )
+        torch.cuda.synchronize()
+        cuda_time = (time.perf_counter() - start) / num_runs * 1000  # ms
+
+        # Print results
+        print("\n" + "="*60)
+        print(f"Performance Comparison (M={self.M}, N={self.N}, K={self.K})")
+        print("="*60)
+        print(f"Ground Truth (Full Precision):  {gt_time:.4f} ms")
+        print(f"Triton FP8 Implementation:       {triton_time:.4f} ms  (Speedup: {gt_time/triton_time:.2f}x)")
+        print(f"CUDA FP8 Implementation:         {cuda_time:.4f} ms  (Speedup: {gt_time/cuda_time:.2f}x)")
+        print(f"\nTriton vs CUDA:                  {cuda_time/triton_time:.2f}x (Triton {'faster' if triton_time < cuda_time else 'slower'})")
+        print("="*60)
+
+
+if __name__ == "__main__":
+    test = TestFP8Base()
+    print("Testing Triton implementation...")
+    test.test_w8a8_block_fp8_matmul()
+    print("Testing CUDA implementation...")
+    test.test_w8a8_block_fp8_cuda_matmul()
+    print("\nRunning performance comparison...")
+    test.test_performance_comparison()
+    print("\nAll tests passed!")
+
