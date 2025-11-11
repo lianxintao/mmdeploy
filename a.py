@@ -5,6 +5,8 @@
 110.40.200.222:21116
 110.40.200.222:21117
 ancFyyI87muqvtIvO8rJziPkOJSWs1Dq1kTroXtTFqo=
+https://triton-lang.cn/main/getting-started/tutorials/index.html
+
 @torch.no_grad()
 def event_loop_pp_disagg_prefill(self: Scheduler) -> None:
     """A pipeline parallel scheduler loop for prefill worker in disaggregation mode."""
