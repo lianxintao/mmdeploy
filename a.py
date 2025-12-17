@@ -1034,53 +1034,144 @@ __global__ void act_mul_f32_kernel(float* __restrict__ out, const float* __restr
 
 
 
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Convert TRT-LLM GPTQ format checkpoint to Kimi-K2-Thinking compressed-tensors format.
+The source GPTQ checkpoint uses:
+- int32 packing: 8 int4 values per int32
+- Requires .qweight, .scales, .qzeros tensors
+TRT-LLM compressed-tensors format uses:
+- int32 packing: 8 int4 values per int32 (same)
+- group_size: 32
+- symmetric quantization
+"""
+
+import argparse
+import json
+from pathlib import Path
+
+import safetensors
+import safetensors.torch
+import torch
+from tqdm import tqdm
 
 
+def unpack_int32_to_int4_gptq(weight_packed: torch.Tensor) -> torch.Tensor:
+    """
+    Unpack GPTQ int32 tensor containing 8 int4 values into int8 tensor.
+    Args:
+        weight_packed: Shape (K/8, N) dtype int32
+    Returns:
+        unpacked: Shape (K, N) dtype int8 with values in range [-8, 7]
+    """
+    # Convert int32 to uint8 view to extract nibbles
+    w_packed_uint8 = weight_packed.contiguous().view(torch.uint8)
+
+    # Each int32 = 4 bytes, each byte has 2 int4 values
+    k_div_8, n = weight_packed.shape
+    w_packed_uint8 = w_packed_uint8.view(k_div_8 * 4, n)
+
+    # Allocate output: (K, N) where K = K_div_8 * 8
+    k = k_div_8 * 8
+    w_unpacked = torch.zeros(k, n, dtype=torch.int8)
+
+    # Extract low and high nibbles
+    w_unpacked[0::2, :] = (w_packed_uint8 & 0x0F).to(torch.int8)
+    w_unpacked[1::2, :] = (w_packed_uint8 >> 4).to(torch.int8)
+
+    # Convert from uint4 [0, 15] to int4 [-8, 7]
+    # Values > 7 should be interpreted as negative
+    w_unpacked[w_unpacked > 7] -= 16
+
+    return w_unpacked.contiguous()
 
 
-def convert_compressed_tensor_to_gptq(
-    weight_packed: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_shape: list[int],
+def pack_int4_to_int32_compressed(weight_unpacked: torch.Tensor) -> torch.Tensor:
+    """
+    Pack int8 tensor (with int4 values) into int32 compressed-tensors format.
+    Args:
+        weight_unpacked: Shape (N, K) dtype int8 with values in range [-8, 7]
+    Returns:
+        packed: Shape (N, K/8) dtype int32
+    """
+    n, k = weight_unpacked.shape
+    assert k % 8 == 0, "K must be divisible by 8"
+
+    # Convert int4 [-8, 7] to uint4 [0, 15]
+    w_uint4 = weight_unpacked.clone()
+    w_uint4[w_uint4 < 0] += 16
+    w_uint4 = w_uint4.to(torch.uint8)
+
+    # Pack 2 uint4 into 1 uint8
+    w_packed_uint8 = torch.zeros(n, k // 2, dtype=torch.uint8)
+    w_packed_uint8 = (w_uint4[:, 1::2] << 4) | (w_uint4[:, 0::2])
+
+    # Reshape to int32: (N, K/2) uint8 -> (N, K/8, 4) uint8 -> (N, K/8) int32
+    w_packed_int32 = (
+        w_packed_uint8.view(n, k // 8, 4).contiguous().view(torch.uint8).view(n, k // 8).view(torch.int32)
+    )
+
+    return w_packed_int32.contiguous()
+
+
+def convert_gptq_to_compressed_tensor(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    qzeros: torch.Tensor,
     group_size: int = 32,
 ) -> dict[str, torch.Tensor]:
     """
-    Convert compressed-tensors format to GPTQ format for TRT-LLM.
+    Convert GPTQ format to compressed-tensors format.
     Args:
-        weight_packed: Shape (N, K/8) dtype int32
-        weight_scale: Shape (N, K/group_size) dtype bfloat16
-        weight_shape: [N, K] - original weight shape
+        qweight: Shape (K/8, N) dtype int32 (GPTQ format is transposed)
+        scales: Shape (K/group_size, N) dtype fp16 (GPTQ format is transposed)
+        qzeros: Shape (K/group_size, N/8) dtype int32 (not used for symmetric)
         group_size: Quantization group size
     Returns:
         Dictionary with:
-            - qweight: Shape (K/8, N) dtype int32 (transposed!)
-            - scales: Shape (K/group_size, N) dtype fp16 (transposed!)
-            - qzeros: Shape (K/group_size, N/8) dtype int32 (for symmetric, all zeros)
+            - weight_packed: Shape (N, K/8) dtype int32
+            - weight_scale: Shape (N, K/group_size) dtype bfloat16
+            - weight_shape: Shape (2,) dtype int64 containing [N, K]
     """
-    n, k = weight_shape
+    k_div_8, n = qweight.shape
+    k = k_div_8 * 8
 
-    # TRT-LLM expects weights transposed: (K, N) instead of (N, K)
-    # But packed format keeps the packing dimension, so:
-    # Source: (N, K/8) -> Target: (K/8, N)
-    qweight = weight_packed.t().contiguous()
+    # GPTQ weights are transposed: (K/8, N) -> Need to transpose back to (N, K/8)
+    # First unpack to (K, N), then transpose to (N, K), then repack to (N, K/8)
+    
+    # Unpack GPTQ format
+    weight_unpacked = unpack_int32_to_int4_gptq(qweight)  # Shape: (K, N)
+    
+    # Transpose to compressed-tensors layout
+    weight_unpacked = weight_unpacked.t().contiguous()  # Shape: (N, K)
+    
+    # Repack in compressed-tensors format
+    weight_packed = pack_int4_to_int32_compressed(weight_unpacked)  # Shape: (N, K/8)
 
-    # Scales also need transpose: (N, K/group_size) -> (K/group_size, N)
-    scales = weight_scale.t().contiguous().to(torch.float16)
+    # Transpose scales: (K/group_size, N) -> (N, K/group_size)
+    weight_scale = scales.t().contiguous().to(torch.bfloat16)
 
-    # For symmetric quantization, we use zero as the zero-point
-    # GPTQ format expects qzeros in packed format
-    # Shape: (K/group_size, N/8) since zeros are also packed 8 per int32
-    num_groups = k // group_size
-    # Create zeros tensor - for symmetric quantization, zero-point is 8 (middle of [0,15])
-    # Pack as uint4: each int32 contains 8 nibbles of value 8
-    # Create as bytes first then view as int32
-    qzeros_uint8 = torch.full((num_groups, n // 2), 0x88, dtype=torch.uint8)
-    qzeros = qzeros_uint8.view(torch.int32).contiguous()
+    # Store original weight shape
+    weight_shape = torch.tensor([n, k], dtype=torch.int64)
 
     return {
-        "qweight": qweight,
-        "scales": scales,
-        "qzeros": qzeros,
+        "weight_packed": weight_packed,
+        "weight_scale": weight_scale,
+        "weight_shape": weight_shape,
     }
 
 
@@ -1091,10 +1182,10 @@ def convert_checkpoint(
     skip_existing: bool = True,
 ):
     """
-    Convert all shards from compressed-tensors to GPTQ format.
+    Convert all shards from GPTQ to compressed-tensors format.
     Args:
-        input_dir: Source checkpoint directory
-        output_dir: Output checkpoint directory
+        input_dir: Source checkpoint directory (GPTQ format)
+        output_dir: Output checkpoint directory (compressed-tensors format)
         num_shards: Number of shards to process (None = all)
         skip_existing: Skip conversion if output shard already exists
     """
@@ -1140,46 +1231,57 @@ def convert_checkpoint(
         # Convert tensors
         output_tensors = {}
 
-        for key, tensor in tqdm(source_tensors.items(), desc="Converting tensors", leave=False):
-            if key.endswith(".weight_packed"):
-                # This is a quantized weight - convert to GPTQ format
-                base_key = key[: -len(".weight_packed")]
-                scale_key = base_key + ".weight_scale"
-                shape_key = base_key + ".weight_shape"
+        # Group GPTQ tensors by base key
+        processed_keys = set()
+        
+        for key in tqdm(source_tensors.keys(), desc="Converting tensors", leave=False):
+            if key in processed_keys:
+                continue
+                
+            if key.endswith(".qweight"):
+                # This is a quantized weight - convert to compressed-tensors format
+                base_key = key[: -len(".qweight")]
+                scales_key = base_key + ".scales"
+                qzeros_key = base_key + ".qzeros"
 
-                if scale_key in source_tensors and shape_key in source_tensors:
-                    weight_shape = source_tensors[shape_key].tolist()
-
-                    # Convert to GPTQ format
-                    gptq_tensors = convert_compressed_tensor_to_gptq(
-                        weight_packed=tensor,
-                        weight_scale=source_tensors[scale_key],
-                        weight_shape=weight_shape,
+                if scales_key in source_tensors and qzeros_key in source_tensors:
+                    # Convert to compressed-tensors format
+                    compressed_tensors = convert_gptq_to_compressed_tensor(
+                        qweight=source_tensors[key],
+                        scales=source_tensors[scales_key],
+                        qzeros=source_tensors[qzeros_key],
                         group_size=32,
                     )
 
-                    # Save with GPTQ naming convention and track in weight_map
-                    qweight_key = base_key + ".qweight"
-                    scales_key = base_key + ".scales"
-                    qzeros_key = base_key + ".qzeros"
+                    # Save with compressed-tensors naming convention
+                    packed_key = base_key + ".weight_packed"
+                    scale_key = base_key + ".weight_scale"
+                    shape_key = base_key + ".weight_shape"
 
-                    output_tensors[qweight_key] = gptq_tensors["qweight"]
-                    output_tensors[scales_key] = gptq_tensors["scales"]
-                    output_tensors[qzeros_key] = gptq_tensors["qzeros"]
+                    output_tensors[packed_key] = compressed_tensors["weight_packed"]
+                    output_tensors[scale_key] = compressed_tensors["weight_scale"]
+                    output_tensors[shape_key] = compressed_tensors["weight_shape"]
 
-                    new_weight_map[qweight_key] = shard_name
-                    new_weight_map[scales_key] = shard_name
-                    new_weight_map[qzeros_key] = shard_name
+                    new_weight_map[packed_key] = shard_name
+                    new_weight_map[scale_key] = shard_name
+                    new_weight_map[shape_key] = shard_name
+
+                    # Mark related keys as processed
+                    processed_keys.add(key)
+                    processed_keys.add(scales_key)
+                    processed_keys.add(qzeros_key)
                 else:
-                    print(f"Warning: Missing scale or shape for {key}")
+                    print(f"Warning: Missing scales or qzeros for {key}")
 
-            elif key.endswith((".weight_scale", ".weight_shape")):
+            elif key.endswith((".scales", ".qzeros")):
                 # Skip these as they're handled above
+                processed_keys.add(key)
                 continue
             else:
                 # Keep non-quantized tensors as-is
-                output_tensors[key] = tensor
+                output_tensors[key] = source_tensors[key]
                 new_weight_map[key] = shard_name
+                processed_keys.add(key)
 
         # Save converted shard
         safetensors.torch.save_file(output_tensors, str(output_file))
@@ -1191,15 +1293,17 @@ def convert_checkpoint(
         with open(config_file) as f:
             config = json.load(f)
 
-        # Remove HuggingFace quantization_config if present
-        config.pop("quantization_config", None)
+        # Remove TRT-LLM quantization config if present
+        config.pop("quantization", None)
 
-        # Add TRT-LLM native quantization config for GPTQ
-        config["quantization"] = {
-            "quant_algo": "W4A16_GPTQ",  # TRT-LLM's enum value
+        # Add HuggingFace compressed-tensors quantization config
+        config["quantization_config"] = {
+            "quant_method": "compressed-tensors",
+            "format": "int-quantized",
             "group_size": 32,
-            "has_zero_point": True,  # GPTQ uses asymmetric quantization
-            "pre_quant_scale": False,  # No pre-quantization scaling
+            "num_bits": 4,
+            "strategy": "channel",
+            "type": "symmetric",
         }
 
         output_config_file = output_path / "config.json"
@@ -1266,19 +1370,19 @@ def convert_checkpoint(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert Kimi-K2 checkpoint to TRT-LLM GPTQ format"
+        description="Convert GPTQ checkpoint to Kimi-K2 compressed-tensors format"
     )
     parser.add_argument(
         "--input-dir",
         type=str,
-        default="/home/scratch.omniml_data_1/models/Kimi-K2-Thinking",
-        help="Input checkpoint directory with compressed-tensors format",
+        default="/home/scratch.omniml_data_2/zhiyuc/checkpoints/Kimi-K2-Thinking-GPTQ",
+        help="Input checkpoint directory with GPTQ format",
     )
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="/home/scratch.omniml_data_2/zhiyuc/checkpoints/Kimi-K2-Thinking-GPTQ",
-        help="Output directory for GPTQ format checkpoint",
+        default="/home/scratch.omniml_data_1/models/Kimi-K2-Thinking-Compressed",
+        help="Output directory for compressed-tensors format checkpoint",
     )
     parser.add_argument(
         "--num-shards",
@@ -1300,6 +1404,10 @@ def main():
         num_shards=args.num_shards,
         skip_existing=not args.no_skip_existing,
     )
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":
