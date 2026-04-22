@@ -1,3 +1,9 @@
+    --mamba-scheduler-strategy extra_buffer \
+    --page-size 64 \
+    --mamba-track-interval 256  # 必须能被page_size整除
+--mamba-full-memory-ratio 
+--mamba-ssm-dtype bfloat16
+
 
 https://app.warp.dev/conversation/a14fd851-85a5-4d53-82bc-961da9724d1e
 **Grep Results:**
