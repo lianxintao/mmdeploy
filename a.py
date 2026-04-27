@@ -1,4 +1,37 @@
-    --mamba-scheduler-strategy extra_buffer \
+
+    # Mirror the dispatch logic used by fused_moe.py's CUDA reduce path:
+    # - topk == 1 + scale == 1.0: directly copy intermediate to output
+    # - topk == 2 + scale == 1.0: use torch.add to avoid an extra reduce kernel
+    # - otherwise: torch.compile variant is faster for small batches per
+    #   micro benchmark, native sgl_kernel.moe_sum_reduce wins for larger ones
+    if topk == 1 and routed_scaling_factor == 1.0:
+        output.copy_(intermediate_cache3.view(M, K))
+    elif topk == 2 and routed_scaling_factor == 1.0:
+        torch.add(
+            intermediate_cache3[:, 0],
+            intermediate_cache3[:, 1],
+            out=output,
+        )
+    else:
+        # According to micro benchmark results, torch.compile can get better
+        # performance for small token.
+        if M <= 32:
+            moe_sum_reduce_torch_compile(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                output,
+                routed_scaling_factor,
+            )
+        else:
+            moe_sum_reduce(
+                intermediate_cache3.view(*intermediate_cache3.shape),
+                output,
+                routed_scaling_factor,
+            )
+    return output
+
+
+
+--mamba-scheduler-strategy extra_buffer \
     --page-size 64 \
     --mamba-track-interval 256  # 必须能被page_size整除
 --mamba-full-memory-ratio 
