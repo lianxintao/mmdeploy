@@ -1,3 +1,4 @@
+
 """
 Fused dequant + gather reference for FlashMLA sparse decoding (MODEL1 only).
 Zero-copy: as_strided views share k_cache memory, kernel uses page-level addressing.
@@ -33,12 +34,18 @@ def _flatten_kvcache(k_cache: torch.Tensor):
     scale_stride = 8
 
     # ---- zero-copy flat views via as_strided ----
-    page_bytes = int(k_cache.stride(0))  # float8 elements (= bytes) per block, includes padding
-    total_bytes = num_blocks * page_bytes
-    # flat uint8 view sharing k_cache memory, stride=1
-    k_u8 = k_cache.view(torch.uint8).as_strided((total_bytes,), (1,))
-    kv_fp8 = k_u8.view(torch.float8_e4m3fn)    # 1 element = 1 byte
-    kv_bf16 = k_u8.view(torch.bfloat16)         # 1 element = 2 bytes
+    # k_cache may be non-contiguous (padding between blocks).  Compute the
+    # exact valid byte range so the as_strided view never overruns storage.
+    page_bytes = int(k_cache.stride(0))      # float8 elements (= bytes) per block
+    bpt_full = int(k_cache.shape[3])         # 584 — bytes per token in transport format
+    # last valid byte in the tensor: (B-1)*stride0 + (S-1)*bpt_full + (bpt_full-1)
+    max_byte = (num_blocks - 1) * page_bytes + block_size * bpt_full
+    # ensure even alignment for bf16 view
+    max_byte = (max_byte + 1) // 2 * 2
+    # flat uint8 view sharing k_cache memory; if non-contiguous, use as_strided directly
+    k_u8 = k_cache.view(torch.uint8).as_strided((max_byte,), (1,))
+    kv_fp8 = k_u8.view(torch.float8_e4m3fn)
+    kv_bf16 = k_u8.view(torch.bfloat16)
 
     # ---- scale: small contiguous copy (N*7 bytes, negligible) ----
     # Scale section starts at byte offset block_size*576 within each block
@@ -351,6 +358,9 @@ def _merge_lse(
     ) / total.unsqueeze(-1)
     merged_lse = max_lse + torch.log(total)
     return merged.to(torch.bfloat16), merged_lse
+
+
+
 """
 Fused dequant + gather reference for FlashMLA sparse decoding (MODEL1 only).
 The triton kernel reads nope/rope directly from overlapping fp8/bf16 views
