@@ -1,4 +1,3 @@
-
 """
 Fused dequant + gather reference for FlashMLA sparse decoding (MODEL1 only).
 Zero-copy: as_strided views share k_cache memory, kernel uses page-level addressing.
@@ -34,18 +33,12 @@ def _flatten_kvcache(k_cache: torch.Tensor):
     scale_stride = 8
 
     # ---- zero-copy flat views via as_strided ----
-    # k_cache may be non-contiguous (padding between blocks).  Compute the
-    # exact valid byte range so the as_strided view never overruns storage.
-    page_bytes = int(k_cache.stride(0))      # float8 elements (= bytes) per block
-    bpt_full = int(k_cache.shape[3])         # 584 — bytes per token in transport format
-    # last valid byte in the tensor: (B-1)*stride0 + (S-1)*bpt_full + (bpt_full-1)
-    max_byte = (num_blocks - 1) * page_bytes + block_size * bpt_full
-    # ensure even alignment for bf16 view
-    max_byte = (max_byte + 1) // 2 * 2
-    # flat uint8 view sharing k_cache memory; if non-contiguous, use as_strided directly
-    k_u8 = k_cache.view(torch.uint8).as_strided((max_byte,), (1,))
-    kv_fp8 = k_u8.view(torch.float8_e4m3fn)
-    kv_bf16 = k_u8.view(torch.bfloat16)
+    page_bytes = int(k_cache.stride(0))  # float8 elements (= bytes) per block, includes padding
+    total_bytes = num_blocks * page_bytes
+    # flat uint8 view sharing k_cache memory, stride=1
+    k_u8 = k_cache.view(torch.uint8).as_strided((total_bytes,), (1,))
+    kv_fp8 = k_u8.view(torch.float8_e4m3fn)    # 1 element = 1 byte
+    kv_bf16 = k_u8.view(torch.bfloat16)         # 1 element = 2 bytes
 
     # ---- scale: small contiguous copy (N*7 bytes, negligible) ----
     # Scale section starts at byte offset block_size*576 within each block
@@ -103,6 +96,7 @@ def _fused_dequant_gather_kernel(
     S_Q: tl.int32,
 ):
     pid = tl.program_id(0)
+    tile_y = tl.program_id(1)                     # which nope tile (0..num_tiles-1)
     tiles_per_seq = topk // BLOCK_TK
     bid_sq = pid // tiles_per_seq
     tile_id = pid % tiles_per_seq
@@ -123,9 +117,9 @@ def _fused_dequant_gather_kernel(
         tk_len = tl.load(topk_length_ptr + bid)
         invalid = invalid | (offs_tk >= tk_len)
 
-    # Store invalid mask
-    mask_ptr = invalid_mask_ptr + bid * stride_mask_b + sid * stride_mask_s + offs_tk
-    tl.store(mask_ptr, invalid.to(tl.int8), mask=t_in_bounds)
+    if tile_y == 0:
+        mask_ptr = invalid_mask_ptr + bid * stride_mask_b + sid * stride_mask_s + offs_tk
+        tl.store(mask_ptr, invalid.to(tl.int8), mask=t_in_bounds)
 
     valid_1d = ~invalid
 
@@ -134,53 +128,55 @@ def _fused_dequant_gather_kernel(
     page_off  = kv_idx_safe % BLOCK_SIZE
     token_byte_base = page_id.to(tl.int64) * PAGE_BYTES + page_off.to(tl.int64) * BPT
 
-    # ---- dequant ALL nope tiles in a loop ----
-    for tile_y in tl.static_range(num_tiles):
-        t_off = tile_y * tile_size
-        offs_d_nope = t_off + tl.arange(0, tile_size)
+    # ---- dequant ONE nope tile (indexed by tile_y) ----
+    t_off = tile_y * tile_size
+    offs_d_nope = t_off + tl.arange(0, tile_size)
 
-        nope_ptr = (
-            kv_fp8_ptr
-            + token_byte_base[:, None]
-            + offs_d_nope[None, :]
-        )
-        nope_fp8 = tl.load(nope_ptr, mask=valid_1d[:, None], other=0.0)
-
-        scale_ptr = k_scale_ptr + kv_idx_safe * stride_scale_n + tile_y
-        scale_raw = tl.load(scale_ptr, mask=valid_1d, other=127)
-        scale = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
-
-        nope_f32 = nope_fp8.to(tl.float32) * scale[:, None]
-        nope_bf16 = nope_f32.to(tl.bfloat16)
-
-        out_ptr = (
-            gathered_kv_ptr
-            + bid * stride_out_b
-            + sid * stride_out_s
-            + offs_tk[:, None] * stride_out_t
-            + offs_d_nope[None, :]
-        )
-        tl.store(out_ptr, nope_bf16, mask=t_in_bounds[:, None])
-
-    # ---- load + store rope ----
-    offs_rope = tl.arange(0, d_rope)
-    rope_byte_base = token_byte_base + ROPE_BYTE_OFF
-    rope_elem_base = rope_byte_base // 2
-    rope_ptr = (
-        kv_bf16_ptr
-        + rope_elem_base[:, None]
-        + offs_rope[None, :]
+    nope_ptr = (
+        kv_fp8_ptr
+        + token_byte_base[:, None]
+        + offs_d_nope[None, :]
     )
-    rope = tl.load(rope_ptr, mask=valid_1d[:, None], other=0.0)
+    nope_fp8 = tl.load(nope_ptr, mask=valid_1d[:, None], other=0.0)
 
-    out_rope_ptr = (
+    # Load e8m0 scale for this tile, convert inline
+    scale_ptr = k_scale_ptr + kv_idx_safe * stride_scale_n + tile_y
+    scale_raw = tl.load(scale_ptr, mask=valid_1d, other=127)
+    scale = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
+
+    # Dequantize
+    nope_f32 = nope_fp8.to(tl.float32) * scale[:, None]
+    nope_bf16 = nope_f32.to(tl.bfloat16)
+
+    out_ptr = (
         gathered_kv_ptr
         + bid * stride_out_b
         + sid * stride_out_s
         + offs_tk[:, None] * stride_out_t
-        + (d_nope + offs_rope)[None, :]
+        + offs_d_nope[None, :]
     )
-    tl.store(out_rope_ptr, rope, mask=t_in_bounds[:, None])
+    tl.store(out_ptr, nope_bf16, mask=t_in_bounds[:, None])
+
+    # ---- load + store rope  (only tile_y == 0) ----
+    if tile_y == 0:
+        offs_rope = tl.arange(0, d_rope)
+        rope_byte_base = token_byte_base + ROPE_BYTE_OFF
+        rope_elem_base = rope_byte_base // 2       # convert byte offset to bf16 element index
+        rope_ptr = (
+            kv_bf16_ptr
+            + rope_elem_base[:, None]
+            + offs_rope[None, :]
+        )
+        rope = tl.load(rope_ptr, mask=valid_1d[:, None], other=0.0)
+
+        out_rope_ptr = (
+            gathered_kv_ptr
+            + bid * stride_out_b
+            + sid * stride_out_s
+            + offs_tk[:, None] * stride_out_t
+            + (d_nope + offs_rope)[None, :]
+        )
+        tl.store(out_rope_ptr, rope, mask=t_in_bounds[:, None])
 
 
 # ---------------------------------------------------------------------------
@@ -214,21 +210,19 @@ def _fused_gather_kv(
         else torch.empty(0, dtype=torch.int32, device=device)
     )
 
-    # Choose BLOCK_TK to ensure at least 32 blocks for GPU occupancy (1D grid)
     BLOCK_TK = 64
     for blk in [64, 32, 16, 8]:
         if topk % blk == 0:
             BLOCK_TK = blk
             break
-    n_blocks = b * s_q * (topk // BLOCK_TK)
-    if n_blocks < 32:
-        for blk in [32, 16, 8, 4]:
+    if b * s_q * (topk // BLOCK_TK) < 16:
+        for blk in [16, 8, 4]:
             if topk % blk == 0:
                 BLOCK_TK = blk
-                if b * s_q * (topk // blk) >= 16:
+                if b * s_q * (topk // blk) >= 8:
                     break
 
-    grid = (b * s_q * (topk // BLOCK_TK),)
+    grid = (b * s_q * (topk // BLOCK_TK), num_tiles)
 
     _fused_dequant_gather_kernel[grid](
         kv_fp8, kv_bf16, k_scale,
@@ -287,12 +281,24 @@ def flash_mla_decode_torch(
         d_nope, d_rope, n_tiles, t_size, rope_off, pg_bytes, bs, bpt,
     )
 
-    # ---------- attention: separate per cache, merge via LSE (no concat) ----------
-    q_flat = q.reshape(b * s_q, h_q, d_qk)
+    # ---------- sparse attention for one KV cache ----------
+    def _sparse_attention(q_flat, kv_flat, mask_3d):
+        """QK^T + softmax + PV for one cache. Returns (output [b,s_q,h,d_v], lse [b,s_q,h])."""
+        topk = kv_flat.shape[2]
+        kv_2d = kv_flat.reshape(b * s_q, topk, d_qk)
+        # bf16 @ bf16 → bf16, only convert attn_weight to f32 for softmax
+        attn_w = (q_2d @ kv_2d.transpose(-1, -2)).float()
+        attn_w *= softmax_scale
+        attn_w[
+            mask_3d.reshape(b * s_q, 1, topk).broadcast_to(b * s_q, h_q, topk)
+        ] = float("-inf")
+        lse_i = attn_w.logsumexp(dim=-1)
+        attn_w = torch.exp(attn_w - lse_i.unsqueeze(-1))
+        out_i = attn_w.to(torch.bfloat16) @ kv_2d[..., :d_v]
+        return out_i.reshape(b, s_q, h_q, d_v), lse_i.reshape(b, s_q, h_q)
 
-    out_main, lse_main = _attention_with_lse(
-        q_flat, gathered_kv, invalid_mask, d_v, softmax_scale,
-    )
+    q_2d = q.reshape(b * s_q, h_q, d_qk)
+    output, lse = _sparse_attention(q_2d, gathered_kv, invalid_mask)
 
     if extra_k_cache is not None:
         assert extra_indices is not None
@@ -302,63 +308,31 @@ def flash_mla_decode_torch(
             ek_fp8, ek_bf16, ek_scale, extra_indices, extra_topk_length,
             d_nope, d_rope, n_tiles, t_size, er_off, epg_bytes, ebs, ebpt,
         )
-        out_extra, lse_extra = _attention_with_lse(
-            q_flat, extra_gkv, extra_mask, d_v, softmax_scale,
-        )
-        output, lse = _merge_lse(out_main, lse_main, out_extra, lse_extra)
-    else:
-        output, lse = out_main, lse_main
+        out_extra, lse_extra = _sparse_attention(q_2d, extra_gkv, extra_mask)
+
+        # Merge via LSE (no concat needed)
+        max_lse = torch.maximum(lse, lse_extra)
+        w1 = torch.exp(lse - max_lse)
+        w2 = torch.exp(lse_extra - max_lse)
+        total = (w1 + w2).clamp(min=1e-20)
+        output = (
+            w1.unsqueeze(-1) * output.float() + w2.unsqueeze(-1) * out_extra.float()
+        ) / total.unsqueeze(-1)
+        lse = max_lse + torch.log(total)
+        output = output.to(torch.bfloat16)
 
     if attn_sink is not None:
+        output = output.float()
         output *= (
             1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
         ).unsqueeze(-1)
+        output = output.to(torch.bfloat16)
 
     lonely_q_mask = lse == float("-inf")
     output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, s_q, h_q, d_v)] = 0.0
     lse[lonely_q_mask] = float("+inf")
 
-    return output.to(torch.bfloat16), lse.transpose(1, 2)
-
-
-def _attention_with_lse(
-    q_flat: torch.Tensor,         # [batch*s_q, h_q, d_qk] bf16
-    gathered_kv: torch.Tensor,    # [b, s_q, topk, d_qk] bf16
-    invalid_mask: torch.Tensor,   # [b, s_q, topk] bool
-    head_dim_v: int,
-    softmax_scale: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compute bf16 attention, return (output [b,s_q,h_q,d_v] bf16, lse [b,s_q,h_q] f32)."""
-    b, s_q, topk, d_qk = gathered_kv.shape[0], gathered_kv.shape[1], gathered_kv.shape[2], gathered_kv.shape[3]
-
-    kv_flat = gathered_kv.reshape(b * s_q, topk, d_qk)
-    attn_weight = (q_flat @ kv_flat.transpose(-1, -2)).float()
-    attn_weight *= softmax_scale
-    attn_weight[
-        invalid_mask.reshape(b * s_q, 1, topk).broadcast_to(b * s_q, q_flat.shape[1], topk)
-    ] = float("-inf")
-
-    lse = attn_weight.logsumexp(dim=-1)
-    attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
-    output = attn_weight.to(torch.bfloat16) @ kv_flat[..., :head_dim_v]
-    return output.reshape(b, s_q, -1, head_dim_v), lse.reshape(b, s_q, -1)
-
-
-def _merge_lse(
-    out1: torch.Tensor, lse1: torch.Tensor,
-    out2: torch.Tensor, lse2: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Merge two attention outputs via LSE-weighted combination."""
-    max_lse = torch.maximum(lse1, lse2)
-    w1 = torch.where(lse1 > -1e20, torch.exp(lse1 - max_lse), torch.zeros_like(lse1))
-    w2 = torch.where(lse2 > -1e20, torch.exp(lse2 - max_lse), torch.zeros_like(lse2))
-    total = (w1 + w2).clamp(min=1e-20)
-    merged = (
-        w1.unsqueeze(-1) * out1.float() + w2.unsqueeze(-1) * out2.float()
-    ) / total.unsqueeze(-1)
-    merged_lse = max_lse + torch.log(total)
-    return merged.to(torch.bfloat16), merged_lse
-
+    return output, lse.transpose(1, 2)
 
 
 """
