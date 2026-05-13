@@ -271,7 +271,6 @@ def flash_mla_decode_torch(
     extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     b, s_q, h_q, d_qk = q.shape
-    d_v = head_dim_v
 
     # ---------- flatten + fused dequant/gather ----------
     (kv_fp8, kv_bf16, k_scale, d_nope, d_rope,
@@ -281,12 +280,13 @@ def flash_mla_decode_torch(
         d_nope, d_rope, n_tiles, t_size, rope_off, pg_bytes, bs, bpt,
     )
 
+    d_v = min(head_dim_v, d_qk)  # defensive: never slice past d_qk
+
     # ---------- sparse attention for one KV cache ----------
     def _sparse_attention(q_flat, kv_flat, mask_3d):
         """QK^T + softmax + PV for one cache. Returns (output [b,s_q,h,d_v], lse [b,s_q,h])."""
         topk = kv_flat.shape[2]
         kv_2d = kv_flat.reshape(b * s_q, topk, d_qk)
-        # bf16 @ bf16 → bf16, only convert attn_weight to f32 for softmax
         attn_w = (q_2d @ kv_2d.transpose(-1, -2)).float()
         attn_w *= softmax_scale
         attn_w[
@@ -333,6 +333,8 @@ def flash_mla_decode_torch(
     lse[lonely_q_mask] = float("+inf")
 
     return output, lse.transpose(1, 2)
+
+
 
 
 """
