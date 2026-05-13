@@ -1,5 +1,333 @@
 """
 Fused dequant + gather reference for FlashMLA sparse decoding (MODEL1 only).
+Zero-copy: as_strided views share k_cache memory, kernel uses page-level addressing.
+Scale is raw uint8 e8m0, kernel converts inline via tl.math.exp2.
+"""
+
+from typing import Optional, Tuple
+
+import torch
+import triton
+import triton.language as tl
+
+
+# ---------------------------------------------------------------------------
+# FP8 KV cache flatten: zero-copy as_strided views + scale metadata
+# ---------------------------------------------------------------------------
+
+def _flatten_kvcache(k_cache: torch.Tensor):
+    """
+    Zero-copy overlapping fp8/bf16 views of the packed MODEL1 KV cache.
+
+    Returns (kv_fp8, kv_bf16, k_scale, d_nope, d_rope, num_tiles, tile_size,
+             rope_bf16_off, page_bytes, block_size, bpt).
+    kv_fp8/bf16 are as_strided flat views sharing the original k_cache memory.
+    k_scale is raw uint8 e8m0 (small contiguous copy).
+    """
+    assert k_cache.ndim == 4 and k_cache.shape[2] == 1
+    num_blocks, block_size = k_cache.shape[:2]
+    N = num_blocks * block_size
+
+    d_nope, d_rope, tile_size, num_tiles = 448, 64, 64, 7
+    bpt = 576  # bytes per token in data section (nope + rope bytes)
+    scale_stride = 8
+
+    # ---- zero-copy flat views via as_strided ----
+    page_bytes = int(k_cache.stride(0))  # float8 elements (= bytes) per block, includes padding
+    total_bytes = num_blocks * page_bytes
+    # flat uint8 view sharing k_cache memory, stride=1
+    k_u8 = k_cache.view(torch.uint8).as_strided((total_bytes,), (1,))
+    kv_fp8 = k_u8.view(torch.float8_e4m3fn)    # 1 element = 1 byte
+    kv_bf16 = k_u8.view(torch.bfloat16)         # 1 element = 2 bytes
+
+    # ---- scale: small contiguous copy (N*7 bytes, negligible) ----
+    # Scale section starts at byte offset block_size*576 within each block
+    flat = k_cache.view(num_blocks, -1)         # preserves strides
+    k_scale = (
+        flat[:, block_size * (d_nope + 2 * d_rope):]
+        .view(num_blocks, block_size, 8)[:, :, :num_tiles]
+        .reshape(N, num_tiles)
+        .view(torch.uint8)
+    )
+
+    rope_bf16_off = d_nope // 2                 # 448 / 2 = 224
+
+    return (kv_fp8, kv_bf16, k_scale, d_nope, d_rope, num_tiles, tile_size,
+            rope_bf16_off, page_bytes, block_size, bpt)
+
+
+# ---------------------------------------------------------------------------
+# Fused dequantize + gather kernel  (page-level addressing, zero-copy views)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _fused_dequant_gather_kernel(
+    kv_fp8_ptr,            # float8e4nv flat  (1-byte elems, shares k_cache memory)
+    kv_bf16_ptr,           # bf16 flat        (2-byte elems, same memory)
+    k_scale_ptr,           # uint8 e8m0       [N, num_tiles] (small contiguous copy)
+    indices_ptr,           # int32            [b, s_q, topk]
+    topk_length_ptr,       # int32            [b] or empty
+    gathered_kv_ptr,       # bf16             [b, s_q, topk, d_qk]
+    invalid_mask_ptr,      # int8             [b, s_q, topk]
+    #
+    d_nope: tl.constexpr,
+    d_rope: tl.constexpr,
+    d_qk: tl.constexpr,
+    num_tiles: tl.constexpr,
+    tile_size: tl.constexpr,
+    rope_bf16_off: tl.constexpr,
+    ROPE_BYTE_OFF: tl.constexpr,           # byte offset of rope within token (448)
+    topk: tl.constexpr,
+    BLOCK_TK: tl.constexpr,
+    HAS_TOPK_LENGTH: tl.constexpr,
+    #
+    PAGE_BYTES: tl.int64,                  # stride_0 of k_cache (bytes per block, includes padding)
+    BLOCK_SIZE: tl.int32,                  # tokens per block (64)
+    BPT: tl.int32,                         # bytes per token in data section (576)
+    stride_scale_n: tl.int32,
+    stride_idx_b: tl.int32,
+    stride_idx_s: tl.int32,
+    stride_out_b: tl.int32,
+    stride_out_s: tl.int32,
+    stride_out_t: tl.int32,
+    stride_mask_b: tl.int32,
+    stride_mask_s: tl.int32,
+    B: tl.int32,
+    S_Q: tl.int32,
+):
+    pid = tl.program_id(0)
+    tile_y = tl.program_id(1)                     # which nope tile (0..num_tiles-1)
+    tiles_per_seq = topk // BLOCK_TK
+    bid_sq = pid // tiles_per_seq
+    tile_id = pid % tiles_per_seq
+    bid = bid_sq // S_Q
+    sid = bid_sq % S_Q
+
+    t_start = tile_id * BLOCK_TK
+    offs_tk = t_start + tl.arange(0, BLOCK_TK)
+    t_in_bounds = offs_tk < topk
+
+    # Load indices
+    idx_ptr = indices_ptr + bid * stride_idx_b + sid * stride_idx_s + offs_tk
+    kv_idx = tl.load(idx_ptr, mask=t_in_bounds, other=-1)
+    invalid = (kv_idx < 0) | ~t_in_bounds
+    kv_idx_safe = tl.maximum(kv_idx, 0)
+
+    if HAS_TOPK_LENGTH:
+        tk_len = tl.load(topk_length_ptr + bid)
+        invalid = invalid | (offs_tk >= tk_len)
+
+    if tile_y == 0:
+        mask_ptr = invalid_mask_ptr + bid * stride_mask_b + sid * stride_mask_s + offs_tk
+        tl.store(mask_ptr, invalid.to(tl.int8), mask=t_in_bounds)
+
+    valid_1d = ~invalid
+
+    # ---- page-level addressing: compute token byte base ----
+    page_id   = kv_idx_safe // BLOCK_SIZE
+    page_off  = kv_idx_safe % BLOCK_SIZE
+    token_byte_base = page_id.to(tl.int64) * PAGE_BYTES + page_off.to(tl.int64) * BPT
+
+    # ---- dequant ONE nope tile (indexed by tile_y) ----
+    t_off = tile_y * tile_size
+    offs_d_nope = t_off + tl.arange(0, tile_size)
+
+    nope_ptr = (
+        kv_fp8_ptr
+        + token_byte_base[:, None]
+        + offs_d_nope[None, :]
+    )
+    nope_fp8 = tl.load(nope_ptr, mask=valid_1d[:, None], other=0.0)
+
+    # Load e8m0 scale for this tile, convert inline
+    scale_ptr = k_scale_ptr + kv_idx_safe * stride_scale_n + tile_y
+    scale_raw = tl.load(scale_ptr, mask=valid_1d, other=127)
+    scale = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
+
+    # Dequantize
+    nope_f32 = nope_fp8.to(tl.float32) * scale[:, None]
+    nope_bf16 = nope_f32.to(tl.bfloat16)
+
+    out_ptr = (
+        gathered_kv_ptr
+        + bid * stride_out_b
+        + sid * stride_out_s
+        + offs_tk[:, None] * stride_out_t
+        + offs_d_nope[None, :]
+    )
+    tl.store(out_ptr, nope_bf16, mask=t_in_bounds[:, None])
+
+    # ---- load + store rope  (only tile_y == 0) ----
+    if tile_y == 0:
+        offs_rope = tl.arange(0, d_rope)
+        rope_byte_base = token_byte_base + ROPE_BYTE_OFF
+        rope_elem_base = rope_byte_base // 2       # convert byte offset to bf16 element index
+        rope_ptr = (
+            kv_bf16_ptr
+            + rope_elem_base[:, None]
+            + offs_rope[None, :]
+        )
+        rope = tl.load(rope_ptr, mask=valid_1d[:, None], other=0.0)
+
+        out_rope_ptr = (
+            gathered_kv_ptr
+            + bid * stride_out_b
+            + sid * stride_out_s
+            + offs_tk[:, None] * stride_out_t
+            + (d_nope + offs_rope)[None, :]
+        )
+        tl.store(out_rope_ptr, rope, mask=t_in_bounds[:, None])
+
+
+# ---------------------------------------------------------------------------
+# Python wrapper
+# ---------------------------------------------------------------------------
+
+def _fused_gather_kv(
+    kv_fp8: torch.Tensor,
+    kv_bf16: torch.Tensor,
+    k_scale: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    d_nope: int,
+    d_rope: int,
+    num_tiles: int,
+    tile_size: int,
+    rope_bf16_off: int,
+    page_bytes: int,
+    block_size: int,
+    bpt: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    b, s_q, topk = indices.shape
+    d_qk = d_nope + d_rope
+    device = kv_fp8.device
+
+    gathered_kv = torch.empty(b, s_q, topk, d_qk, dtype=torch.bfloat16, device=device)
+    invalid_mask = torch.empty(b, s_q, topk, dtype=torch.bool, device=device)
+
+    topk_len_tensor = (
+        topk_length if topk_length is not None
+        else torch.empty(0, dtype=torch.int32, device=device)
+    )
+
+    BLOCK_TK = 64
+    for blk in [64, 32, 16, 8]:
+        if topk % blk == 0:
+            BLOCK_TK = blk
+            break
+    if b * s_q * (topk // BLOCK_TK) < 16:
+        for blk in [16, 8, 4]:
+            if topk % blk == 0:
+                BLOCK_TK = blk
+                if b * s_q * (topk // blk) >= 8:
+                    break
+
+    grid = (b * s_q * (topk // BLOCK_TK), num_tiles)
+
+    _fused_dequant_gather_kernel[grid](
+        kv_fp8, kv_bf16, k_scale,
+        indices, topk_len_tensor,
+        gathered_kv, invalid_mask,
+        d_nope=d_nope,
+        d_rope=d_rope,
+        d_qk=d_qk,
+        num_tiles=num_tiles,
+        tile_size=tile_size,
+        rope_bf16_off=rope_bf16_off,
+        ROPE_BYTE_OFF=d_nope,
+        topk=topk,
+        BLOCK_TK=BLOCK_TK,
+        HAS_TOPK_LENGTH=topk_length is not None,
+        PAGE_BYTES=int(page_bytes),
+        BLOCK_SIZE=block_size,
+        BPT=bpt,
+        stride_scale_n=k_scale.stride(0),
+        stride_idx_b=indices.stride(0),
+        stride_idx_s=indices.stride(1),
+        stride_out_b=gathered_kv.stride(0),
+        stride_out_s=gathered_kv.stride(1),
+        stride_out_t=gathered_kv.stride(2),
+        stride_mask_b=invalid_mask.stride(0),
+        stride_mask_s=invalid_mask.stride(1),
+        B=b, S_Q=s_q,
+    )
+    return gathered_kv, invalid_mask
+
+
+# ---------------------------------------------------------------------------
+# Main decode function
+# ---------------------------------------------------------------------------
+
+def flash_mla_decode_torch(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    head_dim_v: int,
+    softmax_scale: float,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    b, s_q, h_q, d_qk = q.shape
+    d_v = head_dim_v
+
+    # ---------- flatten + fused dequant/gather ----------
+    (kv_fp8, kv_bf16, k_scale, d_nope, d_rope,
+     n_tiles, t_size, rope_off, pg_bytes, bs, bpt) = _flatten_kvcache(k_cache)
+    gathered_kv, invalid_mask = _fused_gather_kv(
+        kv_fp8, kv_bf16, k_scale, indices, topk_length,
+        d_nope, d_rope, n_tiles, t_size, rope_off, pg_bytes, bs, bpt,
+    )
+
+    if extra_k_cache is not None:
+        assert extra_indices is not None
+        (ek_fp8, ek_bf16, ek_scale, _, _, _, _, er_off,
+         epg_bytes, ebs, ebpt) = _flatten_kvcache(extra_k_cache)
+        extra_gkv, extra_mask = _fused_gather_kv(
+            ek_fp8, ek_bf16, ek_scale, extra_indices, extra_topk_length,
+            d_nope, d_rope, n_tiles, t_size, er_off, epg_bytes, ebs, ebpt,
+        )
+        gathered_kv = torch.cat([gathered_kv, extra_gkv], dim=2)
+        invalid_mask = torch.cat([invalid_mask, extra_mask], dim=2)
+
+    # ---------- attention ----------
+    total_topk = gathered_kv.shape[2]
+
+    gathered_kv = gathered_kv.view(b * s_q, total_topk, d_qk).float()
+    gathered_kv[gathered_kv != gathered_kv] = 0.0  # NaN -> 0
+    q_flat = q.float().view(b * s_q, h_q, d_qk)
+
+    attn_weight = q_flat @ gathered_kv.transpose(-1, -2)
+    attn_weight *= softmax_scale
+    attn_weight[
+        invalid_mask.view(b * s_q, 1, total_topk).broadcast_to(
+            b * s_q, h_q, total_topk
+        )
+    ] = float("-inf")
+
+    lse = attn_weight.logsumexp(dim=-1)
+    attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
+    output = attn_weight @ gathered_kv[..., :d_v]
+    output = output.view(b, s_q, h_q, d_v)
+    lse = lse.view(b, s_q, h_q)
+
+    if attn_sink is not None:
+        output *= (
+            1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
+        ).unsqueeze(-1)
+
+    lonely_q_mask = lse == float("-inf")
+    output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, s_q, h_q, d_v)] = 0.0
+    lse[lonely_q_mask] = float("+inf")
+
+    return output.to(torch.bfloat16), lse.transpose(1, 2)
+
+
+
+"""
+Fused dequant + gather reference for FlashMLA sparse decoding (MODEL1 only).
 The triton kernel reads nope/rope directly from overlapping fp8/bf16 views
 that share the same contiguous memory. Scale is raw uint8 e8m0, kernel converts inline.
 """
