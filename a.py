@@ -292,26 +292,27 @@ def flash_mla_decode_torch(
         gathered_kv = torch.cat([gathered_kv, extra_gkv], dim=2)
         invalid_mask = torch.cat([invalid_mask, extra_mask], dim=2)
 
-    # ---------- attention ----------
+    # ---------- mixed-precision attention (keep KV/Q in bf16, softmax in f32) ----------
     total_topk = gathered_kv.shape[2]
 
-    gathered_kv = gathered_kv.view(b * s_q, total_topk, d_qk).float()
-    gathered_kv[gathered_kv != gathered_kv] = 0.0  # NaN -> 0
-    q_flat = q.float().view(b * s_q, h_q, d_qk)
-
-    attn_weight = q_flat @ gathered_kv.transpose(-1, -2)
+    # QK^T in bf16 → bf16 result (saves memory: no gathered_kv.float())
+    q_flat = q.reshape(b * s_q, h_q, d_qk)
+    kv_flat = gathered_kv.reshape(b * s_q, total_topk, d_qk)
+    # bf16 @ bf16 → bf16, then convert only attn_weight to f32 for softmax
+    attn_weight = (q_flat @ kv_flat.transpose(-1, -2)).float()
     attn_weight *= softmax_scale
     attn_weight[
-        invalid_mask.view(b * s_q, 1, total_topk).broadcast_to(
+        invalid_mask.reshape(b * s_q, 1, total_topk).broadcast_to(
             b * s_q, h_q, total_topk
         )
     ] = float("-inf")
 
     lse = attn_weight.logsumexp(dim=-1)
     attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
-    output = attn_weight @ gathered_kv[..., :d_v]
-    output = output.view(b, s_q, h_q, d_v)
-    lse = lse.view(b, s_q, h_q)
+    # PV: f32 scores @ bf16 KV → f32 output (mixed precision)
+    output = attn_weight @ kv_flat[..., :d_v].float()
+    output = output.reshape(b, s_q, h_q, d_v)
+    lse = lse.reshape(b, s_q, h_q)
 
     if attn_sink is not None:
         output *= (
@@ -323,7 +324,6 @@ def flash_mla_decode_torch(
     lse[lonely_q_mask] = float("+inf")
 
     return output.to(torch.bfloat16), lse.transpose(1, 2)
-
 
 
 """
