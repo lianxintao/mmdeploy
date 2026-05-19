@@ -1,4 +1,95 @@
-"""
+大方向接近，但有两个关键点需要校正：
+
+1. **grid 里按 64 个 query heads 分组，不是 64 个 Q token 分组**
+
+在这个 sparse decode kernel 里：
+
+```cpp
+BLOCK_M = 64
+TOPK_BLOCK_SIZE = 64
+```
+
+这里的 `BLOCK_M=64` 指的是 **64 个 query heads**，不是 64 个 query tokens。
+
+grid 是：
+
+```cpp
+dim3(NUM_M_BLOCKS, params.s_q, params.num_sm_parts)
+```
+
+也就是：
+
+```text
+blockIdx.x: query head block，每块 64 个 heads
+blockIdx.y: s_q，query token 位置
+blockIdx.z: split-kv partition
+```
+
+所以一个 CTA 处理的是：
+
+```text
+某个 batch partition 中
+某个 q token 位置 s_q
+某 64 个 query heads
+对若干 sparse topk K/V token block 做 attention
+```
+
+不是 “block 内 64 个 q token”。
+
+2. **K 侧是 topk token 每 64 个一组，head_dim 按 16 进入 WGMMA，shared layout 按 64 维 tile 组织**
+
+对 QK 来说，矩阵形状是：
+
+```text
+Q: 64 query heads x HEAD_DIM_K
+K: 64 topk tokens x HEAD_DIM_K
+P: 64 query heads x 64 topk tokens
+```
+
+所以 `gemm<true, -1>` 算的是：
+
+```text
+[64 heads, HEAD_DIM_K] @ [64 tokens, HEAD_DIM_K]^T
+    -> [64 heads, 64 tokens]
+```
+
+K/V sparse block 是 **64 个 selected KV tokens** 一组，这个理解是对的。
+
+但 Tensor Core 指令层面不是 “head_dim 64 一组算一次”，而是：
+
+```text
+WGMMA atom = 64 x 64 x 16
+```
+
+所以沿 `HEAD_DIM_K` 每 **16** 维发一条 WGMMA。只是在 shared memory layout 上，Q/K 被组织成每 64 维一个 tile：
+
+```text
+HEAD_DIM_K = 512 -> 8 个 64-dim tiles -> 32 条 k16 WGMMA
+HEAD_DIM_K = 576 -> 9 个 64-dim tiles -> 36 条 k16 WGMMA
+```
+
+3. **online softmax 是按 topk block 流式推进**
+
+每处理一个 `TOPK_BLOCK_SIZE=64` 的 sparse K block：
+
+```text
+QK GEMM -> 得到 rP[64 heads, 64 tokens]
+mask / scale / exp2 -> 更新 rM、rL
+S @ V -> 累加 rO
+```
+
+这就是 online softmax。它不是一次性把所有 topk 的 score 存下来，而是每 64 个 KV token 一块推进，持续维护每个 query head 的 running max `rM` 和 running sum `rL`。
+
+所以更准确的表述是：
+
+```text
+SM90 sparse decode 中，一个 CTA 负责一个 q token 位置上的 64 个 query heads；
+K/V 侧按 sparse topk token 每 64 个一块加载、反量化到 shared；
+QK 使用 64x64x16 WGMMA 沿 head_dim_K 累加，得到 64 heads x 64 KV tokens 的 score block；
+随后对这些 KV token blocks 做 online softmax，并立刻执行 S @ V 累加输出。
+```
+
+你原来的理解里，“head 以 64 一组划分到 grid”是对的；“K 侧 64 一组做 online softmax”也基本对；需要改的是 **64 个 q token** 应该是 **64 个 query heads**，以及 **head_dim 的 Tensor Core 计算粒度是 16，不是 64**。"""
 Fused dequant + gather reference for FlashMLA sparse decoding (MODEL1 only).
 Zero-copy: as_strided views share k_cache memory, kernel uses page-level addressing.
 Scale is raw uint8 e8m0, kernel converts inline via tl.math.exp2.
