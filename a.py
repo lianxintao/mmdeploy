@@ -1,3 +1,5 @@
+FLASH_MLA_DISABLE_SM90=1 FLASH_MLA_DISABLE_SM100=1 NVCC_THREADS=1 MAX_JOBS=1 /home/lxt/sglang-deepseekv4/venv/bin/python setup.py build_ext --inplace
+
 大方向接近，但有两个关键点需要校正：
 
 1. **grid 里按 64 个 query heads 分组，不是 64 个 Q token 分组**
