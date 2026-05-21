@@ -1,3 +1,30 @@
+https://zhuanlan.zhihu.com/p/1977830568436729070
+https://zhuanlan.zhihu.com/p/709509776
+https://zhuanlan.zhihu.com/p/29487619626
+https://zhuanlan.zhihu.com/p/1996676825838027333
+https://zhuanlan.zhihu.com/p/1898342901597046440
+https://zhuanlan.zhihu.com/p/1946655041625760922
+https://zhuanlan.zhihu.com/p/1904528950090241151
+https://zhuanlan.zhihu.com/p/1998496931626899392
+https://zhuanlan.zhihu.com/p/1996676673219876343
+https://zhuanlan.zhihu.com/p/2005965686216877524
+https://zhuanlan.zhihu.com/p/30044960843
+https://zhuanlan.zhihu.com/p/1999880734219969724
+https://zhuanlan.zhihu.com/p/1998500372969443453
+https://zhuanlan.zhihu.com/p/1920946738270810330
+https://zhuanlan.zhihu.com/p/1919734554769461686
+https://zhuanlan.zhihu.com/p/1993070679537492733
+https://zhuanlan.zhihu.com/p/2004692692953739350
+https://zhuanlan.zhihu.com/p/700588653
+https://blog.csdn.net/shizheng_Li/article/details/145814258
+https://github.com/Infrasys-AI/AIInfra/tree/main
+https://zhuanlan.zhihu.com/p/1907536883430437857
+https://zhuanlan.zhihu.com/p/1896206045161952147
+https://zhuanlan.zhihu.com/p/1987586644417745413
+
+
+
+
 FLASH_MLA_DISABLE_SM90=1 FLASH_MLA_DISABLE_SM100=1 NVCC_THREADS=1 MAX_JOBS=1 /home/lxt/sglang-deepseekv4/venv/bin/python setup.py build_ext --inplace
 
 大方向接近，但有两个关键点需要校正：
