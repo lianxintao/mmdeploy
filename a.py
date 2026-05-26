@@ -1,3 +1,27 @@
+SGLANG_ENABLE_UNIFIED_RADIX_TREE=1 \
+sglang serve \
+  --trust-remote-code \
+  --model-path deepseek-ai/DeepSeek-V4-Flash \
+  --tp 4 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --speculative-algo EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --chunked-prefill-size 4096 \
+  --disable-flashinfer-autotune \
+  --swa-full-tokens-ratio 0.1 \
+  --tool-call-parser deepseekv4 \
+  --reasoning-parser deepseek-v4 \
+  --enable-hierarchical-cache \
+  --hicache-ratio 2 \
+  --hicache-size 0 \
+  --hicache-write-policy write_through \
+  --hicache-io-backend direct \
+  --hicache-mem-layout page_first_direct \
+  --host 0.0.0.0 \
+  --port 30000
+
 https://claude.ai/share/8b07f39c-935d-4f23-bbd9-11a7130885fd
 
 
