@@ -1,5 +1,10 @@
-https://github.com/botbw/cutlass_learn/blob/main/mma.cu
+https://github.com/66RING/tiny-flash-attention/blob/main/flash_attention_py/main_torch_only.py
+https://github.com/weishengying/cutlass_flash_atten_fp8
 
+
+
+https://github.com/botbw/cutlass_learn/blob/main/mma.cu
+https://zhuanlan.zhihu.com/p/905748811
 https://zhuanlan.zhihu.com/p/661182311
 https://zhuanlan.zhihu.com/p/28168438940
 
