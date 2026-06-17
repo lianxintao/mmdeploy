@@ -1,3 +1,254 @@
+import torch
+import triton
+import triton.language as tl
+from typing import Optional
+
+
+@triton.jit
+def _e8m0_u8_to_f32(x_u8):
+    """
+    E8M0 uint8 -> fp32 scale.
+
+    MXFP8 E8M0:
+        value = 2 ** (x - 127)
+
+    For float32, exponent bits are exactly x.
+    """
+    x_u32 = x_u8.to(tl.uint32)
+    bits = x_u32 << 23
+
+    # x == 0 means 2^-127, represented as float32 subnormal 0x00400000.
+    bits = tl.where(x_u32 == 0, 0x00400000, bits)
+
+    # x == 255 is NaN in E8M0. Keep it as NaN-ish.
+    bits = tl.where(x_u32 == 255, 0x7FC00000, bits)
+
+    return bits.to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def _mxfp8_block_scaled_matmul_kernel(  #
+    a_desc,  # actually raw pointer to A: [M, K], fp16/bf16
+    a_scale_desc,  # kept for API compatibility, unused
+    b_desc,  # actually raw pointer to B: [N, K], fp8_e4m3
+    b_scale_desc,  # actually raw pointer to B scale: [N, K//32], uint8 E8M0
+    c_desc,  # actually raw pointer to C: [M, N]
+    M: tl.constexpr,  #
+    N: tl.constexpr,  #
+    K: tl.constexpr,  #
+    output_type: tl.constexpr,  #
+    BLOCK_M: tl.constexpr,  #
+    BLOCK_N: tl.constexpr,  #
+    BLOCK_K: tl.constexpr,  #
+    rep_m: tl.constexpr,  # kept for API compatibility, unused
+    rep_n: tl.constexpr,  # kept for API compatibility, unused
+    rep_k: tl.constexpr,  # kept for API compatibility, unused
+    NUM_STAGES: tl.constexpr,  #
+):  #
+    pid = tl.program_id(axis=0)
+
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    # grouped scheduling for better B / scale L2 reuse
+    GROUP_M: tl.constexpr = 8
+    group_size = GROUP_M * num_pid_n
+    group_id = pid // group_size
+    first_pid_m = group_id * GROUP_M
+    group_m = tl.minimum(num_pid_m - first_pid_m, GROUP_M)
+
+    pid_in_group = pid - group_id * group_size
+    pid_m = first_pid_m + pid_in_group % group_m
+    pid_n = pid_in_group // group_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_32 = tl.arange(0, 32)
+
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # BLOCK_K must be multiple of 32.
+    # Each MXFP8 scale covers exactly 32 contiguous K elements.
+    for k0 in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
+        for kk in tl.static_range(0, BLOCK_K, 32):
+            offs_k = k0 + kk + offs_32
+            scale_k = (k0 + kk) // 32
+
+            # A: [M, K], fp16/bf16
+            a = tl.load(
+                a_desc + offs_m[:, None] * K + offs_k[None, :],
+                mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+                other=0.0,
+                cache_modifier=".ca",
+            )
+
+            # B: [N, K], fp8_e4m3
+            # load as [BLOCK_N, 32], then transpose for dot
+            b_q = tl.load(
+                b_desc + offs_n[:, None] * K + offs_k[None, :],
+                mask=(offs_n[:, None] < N) & (offs_k[None, :] < K),
+                other=0.0,
+                cache_modifier=".ca",
+            )
+
+            # b_scale: [N, K//32], uint8 E8M0
+            scale_u8 = tl.load(
+                b_scale_desc + offs_n * (K // 32) + scale_k,
+                mask=(offs_n < N) & (scale_k < (K // 32)),
+                other=127,  # E8M0 127 => 1.0
+                cache_modifier=".ca",
+            )
+
+            scale_f32 = _e8m0_u8_to_f32(scale_u8)
+
+            # dequant:
+            #   B_real[n, k] = B_fp8[n, k] * scale[n, k//32]
+            b_f32 = b_q.to(tl.float32) * scale_f32[:, None]
+
+            # Use normal Tensor Core dot.
+            # For SM89, fp16 path is usually fastest.
+            b = b_f32.to(a.dtype)
+
+            accumulator = tl.dot(
+                a,
+                tl.trans(b),
+                accumulator,
+                out_dtype=tl.float32,
+            )
+
+    if output_type == 0:
+        out = accumulator.to(tl.float32)
+    elif output_type == 1:
+        out = accumulator.to(tl.float16)
+    else:
+        out = accumulator.to(tl.bfloat16)
+
+    tl.store(
+        c_desc + offs_m[:, None] * N + offs_n[None, :],
+        out,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+
+def mxfp8_block_scaled_matmul_triton(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    output_dtype: torch.dtype,
+    *,
+    block_m: int = 64,
+    block_n: int = 128,
+    block_k: int = 128,
+    num_stages: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Drop-in replacement with the same Python API as the original function.
+
+    New actual semantics for SM89:
+
+        A:       [M, K], fp16/bf16 activation
+        a_scale: kept for compatibility, ignored
+        B:       [N, K], torch.float8_e4m3fn MXFP8 weight
+        b_scale: [N, K//32], torch.uint8 E8M0 scale_inv / dequant scale
+        output:  [M, N]
+
+    Computes:
+
+        output = A @ dequant(B).T
+
+    Notes:
+        - No TensorDescriptor.
+        - No TMA.
+        - No tl.dot_scaled.
+        - Designed for SM89 / Ada where dot_scaled microscaling is not native.
+    """
+    if num_stages is None:
+        num_stages = 3
+
+    assert a.is_cuda
+    assert b.is_cuda
+    assert b_scale.is_cuda
+
+    assert a.dtype in (torch.float16, torch.bfloat16), (
+        f"Expected A to be fp16/bf16, got {a.dtype}"
+    )
+    assert b.dtype == torch.float8_e4m3fn, (
+        f"Expected B to be torch.float8_e4m3fn, got {b.dtype}"
+    )
+    assert b_scale.dtype == torch.uint8, (
+        f"Expected b_scale to be torch.uint8 E8M0, got {b_scale.dtype}"
+    )
+
+    M, K = a.shape
+    N, K_b = b.shape
+    assert K == K_b, f"K mismatch: A has K={K}, B has K={K_b}"
+    assert K % 32 == 0, "MXFP8 requires K to be divisible by 32"
+    assert block_k % 32 == 0, "block_k must be divisible by 32"
+
+    expected_scale_shape = (N, K // 32)
+    assert b_scale.shape == expected_scale_shape, (
+        f"Expected b_scale shape {expected_scale_shape}, got {tuple(b_scale.shape)}"
+    )
+
+    if output_dtype == torch.float32:
+        output_type = 0
+    elif output_dtype == torch.float16:
+        output_type = 1
+    elif output_dtype == torch.bfloat16:
+        output_type = 2
+    else:
+        raise ValueError(f"Unsupported output dtype: {output_dtype}")
+
+    # Keep same variables as original API.
+    # They are not used by the SM89 raw-pointer kernel, but preserved for compatibility.
+    rep_m = block_m // 128
+    rep_n = block_n // 128
+    rep_k = block_k // 32 // 4
+
+    # Raw-pointer kernel assumes contiguous layout:
+    #   A       [M, K]
+    #   B       [N, K]
+    #   b_scale [N, K//32]
+    a = a.contiguous()
+    b = b.contiguous()
+    b_scale = b_scale.contiguous()
+
+    output = torch.empty((M, N), dtype=output_dtype, device=a.device)
+
+    grid = (triton.cdiv(M, block_m) * triton.cdiv(N, block_n), 1)
+
+    # a_scale is intentionally ignored inside the kernel.
+    # If caller passes None, use A as a dummy pointer to preserve kernel API.
+    if a_scale is None:
+        a_scale_arg = a
+    else:
+        a_scale_arg = a_scale
+
+    _mxfp8_block_scaled_matmul_kernel[grid](
+        a,
+        a_scale_arg,
+        b,
+        b_scale,
+        output,
+        M,
+        N,
+        K,
+        output_type,
+        block_m,
+        block_n,
+        block_k,
+        rep_m,
+        rep_n,
+        rep_k,
+        num_stages,
+        num_warps=4,
+        num_stages=num_stages,
+    )
+
+    return output
+
+
 lmsysorg/sglang:dev-cu12-minimax-m3    https://github.com/66RING/tiny-flash-attention/blob/main/flash_attention_py/main_torch_only.py
 https://github.com/weishengying/cutlass_flash_atten_fp8
 
