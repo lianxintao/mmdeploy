@@ -1,3 +1,5 @@
+mxfp8_block_scaled_matmul_triton
+
 docker pull vllm/vllm-openai:glm52-cu129
 
 import torch
