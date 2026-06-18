@@ -1,3 +1,5 @@
+docker pull vllm/vllm-openai:glm52-cu129
+
 import torch
 import triton
 import triton.language as tl
