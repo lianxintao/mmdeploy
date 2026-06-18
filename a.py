@@ -1,3 +1,6 @@
+
+nvcc -arch=native -O3 -o /tmp/bench_mma scripts/bench_mma_fp8_vs_fp16.cu
+/tmp/bench_mma
 mxfp8_block_scaled_matmul_triton
 
 docker pull vllm/vllm-openai:glm52-cu129
