@@ -1,3 +1,7 @@
+ sudo $(which ncu) --kernel-name regex:sm89_fp8_paged_mqa_logits --launch-skip 10 -c 1 \
+    --metrics gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active \
+    env PYTHONPATH=$PWD <venv-python> tests/ncu_profile_sm89.py
+
 DG_SM89_KV_GROUPS=$G PYTHONPATH=$PWD <venv-python> tests/test_paged_mqa_logits_sm89.py
 nvcc -arch=native -O3 -o /tmp/bench_mma scripts/bench_mma_fp8_vs_fp16.cu
 /tmp/bench_mma
