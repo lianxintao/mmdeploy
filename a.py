@@ -1,4 +1,4 @@
-
+DG_SM89_KV_GROUPS=$G PYTHONPATH=$PWD <venv-python> tests/test_paged_mqa_logits_sm89.py
 nvcc -arch=native -O3 -o /tmp/bench_mma scripts/bench_mma_fp8_vs_fp16.cu
 /tmp/bench_mma
 mxfp8_block_scaled_matmul_triton
