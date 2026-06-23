@@ -1,4 +1,9 @@
- sudo $(which ncu) --kernel-name regex:sm89_fp8_paged_mqa_logits --launch-skip 10 -c 1 \
+dram 吞吐量达到62%~66%，sm计算吞吐量仅为45%，L1 cache， L1 cache 命中率分别为 38%，32%；受限于shared memory大小，每个sm只能同时驻留1个block，
+原因时shared memory 消耗过大，直接锁死了block 的并发数量，并且导致每个scheduler 平均只分到2个活跃的warp，硬件上限时12个；调度器在73%的周期内无就绪的warp可发射，warp 平均每隔7.5个cycle才能
+发射1条指令，原因时活跃warp太少，无法隐藏内存和计算延迟，大约32%的停顿时math pipline 冲突/过度订阅引起的，说明指令类型单一，导致特定计算单元拥堵
+
+
+sudo $(which ncu) --kernel-name regex:sm89_fp8_paged_mqa_logits --launch-skip 10 -c 1 \
     --metrics gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed,sm__warps_active.avg.pct_of_peak_sustained_active \
     env PYTHONPATH=$PWD <venv-python> tests/ncu_profile_sm89.py
 
