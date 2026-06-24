@@ -1,3 +1,51 @@
+#!/usr/bin/env bash
+# Pre-fetch all sgl-kernel third-party deps at their pinned commits into this
+# folder, so the build never has to download them again.
+#
+# Usage:
+#   bash third-party/fetch_deps.sh
+#
+# Re-running is safe: existing repos are fetched + checked out to the pinned
+# commit, not re-cloned. Pass --recurse-submodules behaviour is enabled by
+# default; tarball builds don't need submodules, but cloning them is harmless.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+THIRD_PARTY_DIR="$(pwd)"
+echo "third-party dir: ${THIRD_PARTY_DIR}"
+
+# Optional GitHub mirror prefix (matches CMake GITHUB_ARTIFACTORY). Empty -> github.com
+GITHUB_BASE="${GITHUB_ARTIFACTORY:-github.com}"
+
+# name | repo path | pinned commit/tag
+DEPS=(
+    "cutlass|NVIDIA/cutlass|57e3cfb47a2d9e0d46eb6335c3dc411498efa198"
+    "fmt|fmtlib/fmt|553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28"
+    "triton|triton-lang/triton|v3.6.0"
+    "flashinfer|flashinfer-ai/flashinfer|bc29697ba20b7e6bdb728ded98f04788e16ee021"
+    "sgl-attn|sgl-project/sgl-attn|65c54cc5a6d29fee56036484c749bc5b8e00fd66"
+)
+
+for entry in "${DEPS[@]}"; do
+    IFS='|' read -r name repo ref <<< "${entry}"
+    url="https://${GITHUB_BASE}/${repo}.git"
+    dir="${THIRD_PARTY_DIR}/${name}"
+
+    echo ""
+    echo "=== ${name}  (${repo} @ ${ref}) ==="
+    if [ ! -d "${dir}/.git" ]; then
+        git clone --filter=blob:none "${url}" "${dir}"
+    fi
+
+    git -C "${dir}" fetch --tags origin "${ref}" || git -C "${dir}" fetch --tags origin
+    git -C "${dir}" checkout --force "${ref}"
+    git -C "${dir}" submodule update --init --recursive
+done
+
+echo ""
+echo "All deps fetched into ${THIRD_PARTY_DIR}"
+
+
 dram 吞吐量达到62%~66%，sm计算吞吐量仅为45%，L1 cache， L1 cache 命中率分别为 38%，32%；受限于shared memory大小，每个sm只能同时驻留1个block，
 原因时shared memory 消耗过大，直接锁死了block 的并发数量，并且导致每个scheduler 平均只分到2个活跃的warp，硬件上限时12个；调度器在73%的周期内无就绪的warp可发射，warp 平均每隔7.5个cycle才能
 发射1条指令，原因时活跃warp太少，无法隐藏内存和计算延迟，大约32%的停顿时math pipline 冲突/过度订阅引起的，说明指令类型单一，导致特定计算单元拥堵
