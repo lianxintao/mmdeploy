@@ -1,3 +1,6 @@
+docker pull vllm/vllm-openai:cu129-nightly
+
+
 #!/usr/bin/env bash
 # Pre-fetch all sgl-kernel third-party deps at their pinned commits into this
 # folder, so the build never has to download them again.
