@@ -1,3 +1,13 @@
+SAFETENSORS_FAST_GPU=1 vllm serve MiniMaxAI/MiniMax-M2.5 \
+  --trust-remote-code \
+  --tensor-parallel-size 4 \
+  --enable-auto-tool-choice \
+  --tool-call-parser minimax_m2 \
+  --reasoning-parser minimax_m2_append_think \
+  --speculative-config '{"method":"dflash","model":"z-lab/MiniMax-M2.5-DFlash","num_speculative_tokens":15}' \
+  --attention-backend flash_attn \
+  --max-num-batched-tokens 32768
+
 docker pull vllm/vllm-openai:cu129-nightly
 
 
