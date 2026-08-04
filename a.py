@@ -1,3 +1,6 @@
+https://developer.aliyun.com/article/1683995
+
+
 SAFETENSORS_FAST_GPU=1 vllm serve MiniMaxAI/MiniMax-M2.5 \
   --trust-remote-code \
   --tensor-parallel-size 4 \
