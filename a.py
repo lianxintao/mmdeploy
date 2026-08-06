@@ -1,3 +1,128 @@
+import torch
+from compressed_tensors.quantization import QuantizationScheme
+from compressed_tensors.quantization.quant_scheme import FP8, NVFP4A16
+from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
+from datasets import load_dataset
+from transformers import AutoProcessor, Qwen3_5MoeForConditionalGeneration
+
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.utils import load_context
+
+# NOTE: This example requires transformers >= v5.
+
+MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
+
+# load_context linearizes the routed experts while loading so that every expert
+# projection can be calibrated/quantized independently.
+with load_context(Qwen3_5MoeForConditionalGeneration):
+    model = Qwen3_5MoeForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        dtype="auto",
+    )
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+# Apply static W8A8 FP8 to the four projections in full-attention layers only.
+# Qwen3.6 is a hybrid-attention model: linear-attention (Gated DeltaNet) layers
+# live under `linear_attn` and are deliberately left in their original dtype.
+ATTENTION_TARGETS = [
+    r"re:.*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$",
+]
+
+# load_context expands the checkpoint's stacked 3-D expert tensors into these
+# per-expert Linear modules. Quantize both routed and shared expert projections,
+# but not either router (`mlp.gate` or `mlp.shared_expert_gate`).
+MOE_TARGETS = [
+    r"re:.*\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$",
+    r"re:.*\.mlp\.shared_expert\.(gate_proj|up_proj|down_proj)$",
+]
+
+# These ignores are intentionally explicit safety guards. The narrow targets
+# above already exclude them, but keeping the list documents which sensitive or
+# out-of-scope modules must remain unquantized if a target is broadened later.
+IGNORE = [
+    r"re:.*lm_head$",
+    r"re:.*visual\..*",
+    r"re:.*embed_tokens$",
+    r"re:.*\.mlp\.gate$",
+    r"re:.*\.mlp\.shared_expert_gate$",
+    r"re:.*\.linear_attn\..*",
+]
+
+recipe = QuantizationModifier(
+    config_groups={
+        "attention_fp8": QuantizationScheme(
+            targets=ATTENTION_TARGETS,
+            **FP8,
+        ),
+        "moe_nvfp4a16": QuantizationScheme(
+            targets=MOE_TARGETS,
+            **NVFP4A16,
+        ),
+    },
+    ignore=IGNORE,
+)
+
+NUM_CALIBRATION_SAMPLES = 256
+MAX_SEQUENCE_LENGTH = 4096
+
+ds = load_dataset(
+    "HuggingFaceH4/ultrachat_200k",
+    split=f"train_sft[:{NUM_CALIBRATION_SAMPLES}]",
+)
+ds = ds.select_columns(["messages"])
+ds = ds.shuffle(seed=42)
+
+
+def preprocess_function(example):
+    messages = [
+        {
+            "role": message["role"],
+            "content": [{"type": "text", "text": message["content"]}],
+        }
+        for message in example["messages"]
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        return_dict=True,
+        add_generation_prompt=False,
+        processor_kwargs={
+            "return_tensors": "pt",
+            "padding": False,
+            "truncation": True,
+            "max_length": MAX_SEQUENCE_LENGTH,
+            "add_special_tokens": False,
+        },
+    )
+
+
+ds = ds.map(preprocess_function, batched=False, remove_columns=ds.column_names)
+
+
+def data_collator(batch):
+    assert len(batch) == 1
+    return {key: torch.tensor(value) for key, value in batch[0].items()}
+
+
+oneshot(
+    model=model,
+    recipe=recipe,
+    dataset=ds,
+    max_seq_length=MAX_SEQUENCE_LENGTH,
+    num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+    moe_calibrate_all_experts=True,
+    data_collator=data_collator,
+)
+
+# Qwen3_5MoeForConditionalGeneration does not load the MTP layers, so copy
+# their original (unquantized) tensors into the compressed checkpoint afterward.
+SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-FP8-NVFP4A16"
+model.save_pretrained(SAVE_DIR)
+processor.save_pretrained(SAVE_DIR)
+save_mtp_tensors_to_checkpoint(source_model=MODEL_ID, dest_dir=SAVE_DIR)
+
+
 https://developer.aliyun.com/article/1683995
 
 
