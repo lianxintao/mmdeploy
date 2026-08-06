@@ -1,5 +1,138 @@
 
+  from datasets import load_dataset
+  from transformers import AutoModelForCausalLM, AutoTokenizer
+
   from compressed_tensors.quantization import QuantizationArgs
+  from llmcompressor import oneshot
+  from llmcompressor.modifiers.gptq import GPTQModifier
+  from llmcompressor.modifiers.transform import SpinQuantModifier
+
+
+  # ============================================================
+  # 1. 基本配置
+  # ============================================================
+
+  MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
+  SAVE_DIR = "Meta-Llama-3-8B-SpinQuant-GPTQ-NVFP4-FP8-Head-KV"
+
+  NUM_CALIBRATION_SAMPLES = 512
+  MAX_SEQUENCE_LENGTH = 2048
+
+
+  # ============================================================
+  # 2. 加载模型和 tokenizer
+  # ============================================================
+
+  model = AutoModelForCausalLM.from_pretrained(
+      MODEL_ID,
+      dtype="auto",
+  )
+
+  tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+
+
+  # ============================================================
+  # 3. 准备校准数据
+  # ============================================================
+
+  dataset = load_dataset(
+      "HuggingFaceH4/ultrachat_200k",
+      split=f"train_sft[:{NUM_CALIBRATION_SAMPLES}]",
+  )
+
+  dataset = dataset.shuffle(seed=42)
+
+
+  def process_and_tokenize(example):
+      text = tokenizer.apply_chat_template(
+          example["messages"],
+          tokenize=False,
+      )
+
+      return tokenizer(
+          text,
+          padding=False,
+          truncation=True,
+          max_length=MAX_SEQUENCE_LENGTH,
+          add_special_tokens=False,
+      )
+
+
+  dataset = dataset.map(
+      process_and_tokenize,
+      remove_columns=dataset.column_names,
+  )
+
+
+  # ============================================================
+  # 4. 配置 FP8 per-head KV Cache
+  # ============================================================
+
+  fp8_per_head_kv_cache = QuantizationArgs(
+      num_bits=8,
+      type="float",
+      strategy="attn_head",
+      symmetric=True,
+      dynamic=False,
+      observer="static_minmax",
+  )
+
+
+  # ============================================================
+  # 5. 配置 Hadamard + GPTQ NVFP4
+  # ============================================================
+
+  recipe = [
+      # R1/R2 可以融合进权重，没有额外在线旋转开销
+      SpinQuantModifier(
+          rotations=["R1", "R2"],
+          transform_type="hadamard",
+          transform_block_size=128,
+      ),
+
+      # 在旋转后的模型上执行 GPTQ，直接量化为 NVFP4
+      GPTQModifier(
+          targets="Linear",
+          scheme="NVFP4",
+          ignore=[
+              "lm_head",
+
+              # MoE 模型可按需忽略 router
+              # r"re:.*router.*",
+              # r"re:.*mlp\.gate$",
+          ],
+          actorder="static",
+          block_size=128,
+          dampening_frac=0.01,
+
+          # 显存不足时改成 True
+          offload_hessians=False,
+
+          # 校准静态 FP8 per-head K/V scale
+          kv_cache_scheme=fp8_per_head_kv_cache,
+      ),
+  ]
+
+
+  # ============================================================
+  # 6. 执行量化
+  # ============================================================
+
+  oneshot(
+      model=model,
+      dataset=dataset,
+      recipe=recipe,
+
+      # 保证先完成 SpinQuant，再用旋转后的模型校准 GPTQ 和 KV scale
+      pipeline="independent",
+
+      num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+      max_seq_length=MAX_SEQUENCE_LENGTH,
+  )
+
+  
+
+from compressed_tensors.quantization import QuantizationArgs
 
   from llmcompressor.modifiers.gptq import GPTQModifier
   from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
