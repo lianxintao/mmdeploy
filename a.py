@@ -1,3 +1,31 @@
+
+  from compressed_tensors.quantization import QuantizationArgs
+
+  from llmcompressor.modifiers.gptq import GPTQModifier
+  from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
+
+  recipe = [
+      SmoothQuantModifier(
+          smoothing_strength=0.5,
+      ),
+      GPTQModifier(
+          targets="Linear",
+          scheme="NVFP4",
+          ignore=["lm_head"],
+          actorder="static",
+          kv_cache_scheme=QuantizationArgs(
+              num_bits=8,
+              type="float",
+              strategy="tensor",
+              symmetric=True,
+              dynamic=False,
+          ),
+      ),
+  ]
+
+
+
+
 import torch
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.quantization.quant_scheme import FP8, NVFP4A16
