@@ -1,4 +1,4 @@
-
+YDJaken/DeepSeek-V4-Flash-0731-w8a8
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   torchrun \
     --standalone \
