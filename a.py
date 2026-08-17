@@ -1,4 +1,21 @@
- python examples/hf_ptq/hf_ptq.py \
+  torchrun --nproc_per_node=8 examples/hf_ptq/hf_ptq.py \
+      --pyt_ckpt_path zai-org/GLM-5.2 \
+      --recipe glm52-attn-fp8-moe-w4a16-kv-fp8.yaml \
+      --dataset /data/datasets/cnn_dailymail \
+      --calib_size 4 \
+      --calib_seq 512 \
+      --batch_size 1 \
+      --skip_generate \
+      --trust_remote_code \
+      --use_fsdp2 \
+      --verbose \
+      --export_path /path/to/GLM-5.2-AttnFP8-MoE-W4A16-NVFP4
+
+
+
+
+
+python examples/hf_ptq/hf_ptq.py \
       --pyt_ckpt_path zai-org/GLM-5.2 \
       --qformat w4a16_nvfp4 \
       --kv_cache_qformat fp8_cast \
