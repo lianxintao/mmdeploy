@@ -1,4 +1,21 @@
-  torchrun --nproc_per_node=8 examples/hf_ptq/hf_ptq.py \
+ python examples/hf_ptq/hf_ptq.py \
+      --pyt_ckpt_path zai-org/GLM-5.2 \
+      --recipe huggingface/glm_moe_dsa/ptq/glm52-attn-fp8-moe-w4a16-kv-fp8 \
+      --dataset /data/datasets/cnn_dailymail \
+      --calib_size 4 \
+      --calib_seq 512 \
+      --batch_size 1 \
+      --skip_generate \
+      --trust_remote_code \
+      --offload_folder /data/modelopt_offload/glm52 \
+      --max_cpu_memory_gb 512 \
+      --verbose \
+      --export_path /path/to/GLM-5.2-AttnFP8-MoE-W4A16-NVFP4
+
+
+
+
+torchrun --nproc_per_node=8 examples/hf_ptq/hf_ptq.py \
       --pyt_ckpt_path zai-org/GLM-5.2 \
       --recipe glm52-attn-fp8-moe-w4a16-kv-fp8.yaml \
       --dataset /data/datasets/cnn_dailymail \
