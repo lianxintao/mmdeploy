@@ -13,6 +13,112 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# GLM-5.2 mixed-precision PTQ with layerwise disk-offload support: FP8 attention
+# and dense MLPs, routed-expert W4A16 NVFP4, and calibrated FP8 KV cache.
+
+imports:
+  base_disable_all: configs/ptq/units/base_disable_all
+  default_disabled_quantizers: configs/ptq/units/default_disabled_quantizers
+  fp8: configs/numerics/fp8
+  kv_fp8: configs/ptq/units/kv_fp8
+  nvfp4: configs/numerics/nvfp4
+
+metadata:
+  recipe_type: ptq
+  description: >-
+    GLM-5.2 mixed-precision PTQ with W8A8 FP8 self-attention and dense MLPs,
+    W4A16 NVFP4 routed-expert weights, calibrated FP8 KV cache, and
+    non-mutating layerwise calibration for disk offload. Embeddings, norms,
+    lm_head, routers, shared experts, MTP, and the complete DSA indexer remain
+    in high precision.
+
+quantize:
+  algorithm:
+    method: max
+    layerwise:
+      enable: true
+      calib_mutates_weights: false
+  quant_cfg:
+    - $import: base_disable_all
+
+    # W8A8 FP8 on the five MLA projection families. Norms and the DSA indexer
+    # are not matched by these projection-specific rules.
+    - quantizer_name: '*self_attn.q_a_proj*weight_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.q_a_proj*input_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.q_b_proj*weight_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.q_b_proj*input_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.kv_a_proj_with_mqa*weight_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.kv_a_proj_with_mqa*input_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.kv_b_proj*weight_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.kv_b_proj*input_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.o_proj*weight_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*self_attn.o_proj*input_quantizer*'
+      cfg: {$import: fp8}
+
+    # Layers 0-2 are dense MLPs. The single-character class deliberately does
+    # not match layers 10, 20, and so on.
+    - quantizer_name: '*model.layers.[0-2].mlp*weight_quantizer*'
+      cfg: {$import: fp8}
+    - quantizer_name: '*model.layers.[0-2].mlp*input_quantizer*'
+      cfg: {$import: fp8}
+
+    # Fused routed-expert gate_up_proj/down_proj tensors receive per-expert
+    # W4A16 NVFP4 weight quantizers; their input quantizers stay disabled.
+    - quantizer_name: '*mlp.experts*weight_quantizer*'
+      cfg: {$import: nvfp4}
+
+    # Calibrated FP8 K/V cache.
+    - $import: kv_fp8
+    - $import: default_disabled_quantizers
+
+    # Explicit high-precision exclusions. These entries come last so they win
+    # over every enable rule above.
+    - quantizer_name: '*embed_tokens*'
+      enable: false
+    - quantizer_name: '*model.norm*'
+      enable: false
+    - quantizer_name: '*lm_head*'
+      enable: false
+    - quantizer_name: '*layernorm*'
+      enable: false
+    - quantizer_name: '*self_attn.indexer*'
+      enable: false
+    - quantizer_name: '*mlp.gate.*'
+      enable: false
+    - quantizer_name: '*mlp.shared_experts*'
+      enable: false
+    - quantizer_name: '*model.layers.78*'
+      enable: false
+    - quantizer_name: '*mtp*'
+      enable: false
+
+
+
+
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # GLM-5.2 mixed-precision PTQ with layerwise disk-offload support: FP8 attention,
 # routed-expert W4A16 NVFP4, and calibrated FP8 KV cache.
 
