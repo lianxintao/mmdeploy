@@ -13,28 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GLM-5.2 mixed-precision PTQ: FP8 attention, routed-expert W4A16 NVFP4,
-# and FP8 KV-cache cast. Dense/shared MLPs and sensitive routing/indexing stay high precision.
+# GLM-5.2 mixed-precision PTQ with layerwise disk-offload support: FP8 attention,
+# routed-expert W4A16 NVFP4, and calibrated FP8 KV cache.
 
 imports:
   base_disable_all: configs/ptq/units/base_disable_all
   default_disabled_quantizers: configs/ptq/units/default_disabled_quantizers
   fp8: configs/numerics/fp8
-  kv_fp8_cast: configs/ptq/units/kv_fp8_cast
+  kv_fp8: configs/ptq/units/kv_fp8
   nvfp4: configs/numerics/nvfp4
 
 metadata:
   recipe_type: ptq
   description: >-
     GLM-5.2 mixed-precision PTQ with W8A8 FP8 self-attention, W4A16 NVFP4
-    routed-expert weights, and FP8 KV-cache cast. Shared experts, dense MLPs,
-    routers, lm_head, MTP, and indexer weights_proj remain in high precision.
+    routed-expert weights, calibrated FP8 KV cache, and non-mutating layerwise
+    calibration for disk offload. Shared experts, dense MLPs, routers, lm_head,
+    MTP, and indexer weights_proj remain in high precision.
 
 quantize:
   algorithm:
     method: max
     layerwise:
-      enable: false
+      enable: true
+      calib_mutates_weights: false
   quant_cfg:
     - $import: base_disable_all
 
@@ -48,7 +50,7 @@ quantize:
     - quantizer_name: '*self_attn*input_quantizer*'
       cfg: {$import: fp8}
 
-    - $import: kv_fp8_cast
+    - $import: kv_fp8
     - $import: default_disabled_quantizers
 
     # Transformers keeps this DSA scoring projection in FP32.
