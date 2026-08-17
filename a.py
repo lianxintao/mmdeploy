@@ -1,3 +1,18 @@
+ python examples/hf_ptq/hf_ptq.py \
+      --pyt_ckpt_path zai-org/GLM-5.2 \
+      --qformat w4a16_nvfp4 \
+      --kv_cache_qformat fp8_cast \
+      --dataset /data/datasets/cnn_dailymail \
+      --calib_size 4 \
+      --calib_seq 512 \
+      --batch_size 1 \
+      --skip_generate \
+      --trust_remote_code \
+      --low_memory_mode \
+      --export_path /path/to/GLM-5.2-W4A16-NVFP4
+
+
+
 YDJaken/DeepSeek-V4-Flash-0731-w8a8
   CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
   torchrun \
