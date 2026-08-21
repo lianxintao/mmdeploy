@@ -1,3 +1,427 @@
+examples/quantization_w4a16/qwen3_8_27b_mlp_w8a16.py
+import torch
+from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
+from datasets import load_dataset
+from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+
+from llmcompressor import oneshot
+from llmcompressor.modifiers.gptq import GPTQModifier
+
+# NOTE: Qwen3.8 requires transformers >= 5.8.0.
+
+MODEL_ID = "Qwen/Qwen3.8-27B"
+
+model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    MODEL_ID,
+    dtype="auto",
+)
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+# Quantize only the three dense MLP projections in the 64 text-transformer
+# layers. Anchoring the full module path keeps the vision tower, linear/full
+# attention, embeddings, lm_head, and the auxiliary MTP layer in BF16.
+MLP_TARGETS = [
+    r"re:^model\.language_model\.layers\.\d+\.mlp\."
+    r"(gate_proj|up_proj|down_proj)$",
+]
+
+IGNORE = [
+    r"re:.*lm_head$",
+    r"re:.*visual\..*",
+    r"re:.*embed_tokens$",
+    r"re:.*\.self_attn\..*",
+    r"re:.*\.linear_attn\..*",
+    r"re:^mtp\..*",
+]
+
+# Symmetric INT8 weight-only GPTQ with a K-dimension group size of 128.
+# No input_activations configuration is provided, so activations stay in the
+# model's original 16-bit dtype (BF16 here): W8A16-G128.
+W8A16_G128 = QuantizationScheme(
+    targets=MLP_TARGETS,
+    weights=QuantizationArgs(
+        num_bits=8,
+        type="int",
+        symmetric=True,
+        strategy="group",
+        group_size=128,
+        dynamic=False,
+    ),
+)
+
+recipe = GPTQModifier(
+    config_groups={"text_mlp_w8a16_g128": W8A16_G128},
+    ignore=IGNORE,
+    # GPTQ Hessian update block size; this is separate from weight group_size.
+    block_size=128,
+    dampening_frac=0.01,
+    actorder=None,
+    # Move Hessians to CPU between updates to reduce peak GPU memory usage.
+    offload_hessians=True,
+)
+
+NUM_CALIBRATION_SAMPLES = 512
+MAX_SEQUENCE_LENGTH = 2048
+
+ds = load_dataset(
+    "HuggingFaceH4/ultrachat_200k",
+    split=f"train_sft[:{NUM_CALIBRATION_SAMPLES}]",
+)
+ds = ds.select_columns(["messages"])
+ds = ds.shuffle(seed=42)
+
+
+def preprocess_function(example):
+    messages = [
+        {
+            "role": message["role"],
+            "content": [{"type": "text", "text": message["content"]}],
+        }
+        for message in example["messages"]
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        return_dict=True,
+        add_generation_prompt=False,
+        processor_kwargs={
+            "return_tensors": "pt",
+            "padding": False,
+            "truncation": True,
+            "max_length": MAX_SEQUENCE_LENGTH,
+            "add_special_tokens": False,
+        },
+    )
+
+
+ds = ds.map(preprocess_function, batched=False, remove_columns=ds.column_names)
+
+
+def data_collator(batch):
+    assert len(batch) == 1
+    return {key: torch.tensor(value) for key, value in batch[0].items()}
+
+
+oneshot(
+    model=model,
+    recipe=recipe,
+    dataset=ds,
+    max_seq_length=MAX_SEQUENCE_LENGTH,
+    num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+    data_collator=data_collator,
+)
+
+# Qwen3_5ForConditionalGeneration does not load the MTP tensors. Save the
+# compressed main model first, then copy the original unquantized MTP tensors
+# into the output checkpoint so speculative decoding remains available.
+SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-MLP-W8A16-G128-GPTQ"
+model.save_pretrained(SAVE_DIR)
+processor.save_pretrained(SAVE_DIR)
+save_mtp_tensors_to_checkpoint(source_model=MODEL_ID, dest_dir=SAVE_DIR)
+
+examples/quantization_w4a16/qwen3_8_27b_mlp_fp8_w8a16_block128.py
+
+
+import json
+import re
+from pathlib import Path
+
+import torch
+from compressed_tensors.compressors import ModelCompressor
+from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+from compressed_tensors.utils import (
+    align_module_device,
+    delete_offload_parameter,
+    get_offloaded_device,
+    has_offloaded_params,
+    register_offload_parameter,
+    save_mtp_tensors_to_checkpoint,
+)
+from datasets import load_dataset
+from safetensors import safe_open
+from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+
+from llmcompressor import oneshot
+from llmcompressor.modifiers.gptq import GPTQModifier
+
+# NOTE: Qwen3.8 requires transformers >= 5.8.0.
+
+MODEL_ID = "Qwen/Qwen3.8-27B"
+SAVE_DIR = Path("Qwen3.8-27B-MLP-FP8-W8A16-B128-GPTQ-SGLANG")
+
+NUM_CALIBRATION_SAMPLES = 512
+MAX_SEQUENCE_LENGTH = 2048
+WEIGHT_BLOCK_SIZE = [128, 128]
+
+# Quantize only the three dense MLP projections in the text-transformer layers.
+# The full-path anchor keeps attention, vision, embeddings, lm_head and MTP in BF16.
+MLP_PATTERN = re.compile(
+    r"^model\.language_model\.layers\.\d+\.mlp\."
+    r"(gate_proj|up_proj|down_proj)$"
+)
+MLP_TARGETS = [f"re:{MLP_PATTERN.pattern}"]
+
+IGNORE = [
+    r"re:.*lm_head$",
+    r"re:.*visual\..*",
+    r"re:.*embed_tokens$",
+    r"re:.*\.self_attn\..*",
+    r"re:.*\.linear_attn\..*",
+    r"re:^mtp\..*",
+]
+
+# FP8 E4M3 weights with one scale per 128x128 two-dimensional weight block.
+# There is deliberately no input_activations entry: calibration/GPTQ sees BF16
+# activations and the serialized checkpoint contains only quantized weights.
+FP8_W8A16_BLOCK128 = QuantizationScheme(
+    targets=MLP_TARGETS,
+    weights=QuantizationArgs(
+        num_bits=8,
+        type="float",
+        symmetric=True,
+        strategy="block",
+        block_structure=WEIGHT_BLOCK_SIZE,
+        dynamic=False,
+    ),
+)
+
+
+def get_quantized_module_names(model):
+    names = [
+        name
+        for name, _module in model.named_modules()
+        if MLP_PATTERN.fullmatch(name)
+    ]
+    if not names:
+        raise RuntimeError(f"No modules matched {MLP_PATTERN.pattern!r}")
+
+    for name in names:
+        weight = model.get_submodule(name).weight
+        rows, columns = weight.shape
+        block_rows, block_columns = WEIGHT_BLOCK_SIZE
+        if rows % block_rows or columns % block_columns:
+            raise ValueError(
+                f"{name}.weight has shape {tuple(weight.shape)}, which is not "
+                f"divisible by block size {WEIGHT_BLOCK_SIZE}"
+            )
+    return names
+
+
+def rename_scale_for_sglang(module):
+    """Rename compressed-tensors' weight_scale to SGLang's weight_scale_inv."""
+    if "weight_scale_inv" in module._parameters:
+        return
+    if "weight_scale" not in module._parameters:
+        raise RuntimeError(f"{module} has no compressed FP8 weight_scale parameter")
+
+    if has_offloaded_params(module):
+        offload_device = get_offloaded_device(module)
+        with align_module_device(module):
+            scale = module.weight_scale.detach().clone()
+        delete_offload_parameter(module, "weight_scale")
+        register_offload_parameter(
+            module,
+            "weight_scale_inv",
+            torch.nn.Parameter(scale, requires_grad=False),
+            offload_device,
+        )
+    else:
+        scale = module._parameters.pop("weight_scale")
+        module.register_parameter("weight_scale_inv", scale)
+
+
+def set_native_sglang_fp8_config(model):
+    # SGLang's native block-FP8 loader uses an exclusion list. These component
+    # path entries exclude every Linear except the dense MLP projections.
+    native_config = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": WEIGHT_BLOCK_SIZE,
+        "ignored_layers": [
+            "visual",
+            "lm_head",
+            "embed_tokens",
+            "self_attn",
+            "linear_attn",
+            "mtp",
+        ],
+        "packed_modules_mapping": {
+            "gate_up_proj": ["gate_proj", "up_proj"],
+            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        },
+    }
+    model.config.quantization_config = native_config
+
+    # Avoid leaving a second compressed-tensors config in the nested text config.
+    text_config = model.config.get_text_config(decoder=True)
+    if text_config is not model.config and hasattr(text_config, "quantization_config"):
+        text_config.quantization_config = None
+
+    return native_config
+
+
+def save_with_original_transformers_method(model, save_dir):
+    # llm-compressor wraps save_pretrained and would write compressed-tensors
+    # metadata. The model has already been compressed above, so call the original
+    # Transformers implementation and preserve the native SGLang FP8 metadata.
+    original_save = getattr(model.save_pretrained, "__wrapped__", None)
+    if original_save is None:
+        raise RuntimeError("llm-compressor did not wrap model.save_pretrained")
+    original_save(
+        model,
+        save_dir,
+        safe_serialization=True,
+        max_shard_size="5GB",
+    )
+
+
+def force_config_json(save_dir, native_config):
+    config_path = save_dir / "config.json"
+    with config_path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+    config["quantization_config"] = native_config
+    if isinstance(config.get("text_config"), dict):
+        config["text_config"].pop("quantization_config", None)
+    with config_path.open("w", encoding="utf-8") as file:
+        json.dump(config, file, ensure_ascii=False, indent=2)
+        file.write("\n")
+
+
+def validate_saved_checkpoint(save_dir, quantized_module_names):
+    index_path = save_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        raise RuntimeError(f"Expected sharded checkpoint index at {index_path}")
+
+    with index_path.open("r", encoding="utf-8") as file:
+        weight_map = json.load(file)["weight_map"]
+
+    missing = [
+        f"{name}.weight_scale_inv"
+        for name in quantized_module_names
+        if f"{name}.weight_scale_inv" not in weight_map
+    ]
+    stale = [
+        f"{name}.weight_scale"
+        for name in quantized_module_names
+        if f"{name}.weight_scale" in weight_map
+    ]
+    if missing or stale:
+        raise RuntimeError(
+            f"Invalid scale names: missing weight_scale_inv={missing[:3]}, "
+            f"stale weight_scale={stale[:3]}"
+        )
+
+    first_weight = f"{quantized_module_names[0]}.weight"
+    shard_path = save_dir / weight_map[first_weight]
+    with safe_open(shard_path, framework="pt", device="cpu") as file:
+        dtype = file.get_slice(first_weight).get_dtype()
+    if dtype not in ("F8_E4M3", "F8_E4M3FN"):
+        raise RuntimeError(f"Expected FP8 E4M3 weight, got {dtype} for {first_weight}")
+
+
+model = Qwen3_5ForConditionalGeneration.from_pretrained(
+    MODEL_ID,
+    dtype="auto",
+)
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+quantized_module_names = get_quantized_module_names(model)
+
+recipe = GPTQModifier(
+    config_groups={"text_mlp_fp8_w8a16_block128": FP8_W8A16_BLOCK128},
+    ignore=IGNORE,
+    # GPTQ Hessian update block size; independent from the 128x128 weight blocks.
+    block_size=128,
+    dampening_frac=0.01,
+    actorder=None,
+    offload_hessians=True,
+)
+
+dataset = load_dataset(
+    "HuggingFaceH4/ultrachat_200k",
+    split=f"train_sft[:{NUM_CALIBRATION_SAMPLES}]",
+)
+dataset = dataset.select_columns(["messages"]).shuffle(seed=42)
+
+
+def preprocess_function(example):
+    messages = [
+        {
+            "role": message["role"],
+            "content": [{"type": "text", "text": message["content"]}],
+        }
+        for message in example["messages"]
+    ]
+    return processor.apply_chat_template(
+        messages,
+        tokenize=True,
+        return_dict=True,
+        add_generation_prompt=False,
+        processor_kwargs={
+            "return_tensors": "pt",
+            "padding": False,
+            "truncation": True,
+            "max_length": MAX_SEQUENCE_LENGTH,
+            "add_special_tokens": False,
+        },
+    )
+
+
+dataset = dataset.map(
+    preprocess_function,
+    batched=False,
+    remove_columns=dataset.column_names,
+)
+
+
+def data_collator(batch):
+    assert len(batch) == 1
+    return {key: torch.tensor(value) for key, value in batch[0].items()}
+
+
+oneshot(
+    model=model,
+    recipe=recipe,
+    dataset=dataset,
+    max_seq_length=MAX_SEQUENCE_LENGTH,
+    num_calibration_samples=NUM_CALIBRATION_SAMPLES,
+    data_collator=data_collator,
+)
+
+# Materialize llm-compressor's fake-quantized weights as FP8 E4M3 tensors.
+compressor = ModelCompressor.from_pretrained_model(model)
+compressor.compress_model(model)
+
+for module_name in quantized_module_names:
+    rename_scale_for_sglang(model.get_submodule(module_name))
+
+native_config = set_native_sglang_fp8_config(model)
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+save_with_original_transformers_method(model, SAVE_DIR)
+processor.save_pretrained(SAVE_DIR)
+
+# Qwen3_5ForConditionalGeneration does not load the MTP tensors; preserve them
+# from the source checkpoint for speculative decoding.
+save_mtp_tensors_to_checkpoint(source_model=MODEL_ID, dest_dir=SAVE_DIR)
+force_config_json(SAVE_DIR, native_config)
+validate_saved_checkpoint(SAVE_DIR, quantized_module_names)
+
+print(
+    f"Saved {len(quantized_module_names)} FP8 block-quantized MLP modules "
+    f"to {SAVE_DIR}"
+)
+print("For FP8 Marlin W8A16, launch SGLang with SGLANG_FORCE_FP8_MARLIN=1")
+
+
+
+
+
+
+
+
+
+
+
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
