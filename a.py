@@ -1,3 +1,5 @@
+https://a142064-we7h-2760ed5a.bjb3.seetacloud.com:8443/jupyter/lab
+
 import torch
 from compressed_tensors.quantization import QuantizationScheme
 from compressed_tensors.utils import save_mtp_tensors_to_checkpoint
