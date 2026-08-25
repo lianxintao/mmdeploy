@@ -18,6 +18,284 @@ the original checkpoint, offload cache, Hessians, and compressed checkpoint.
 import re
 from pathlib import Path
 
+import torch.distributed as dist
+from compressed_tensors.offload import init_dist
+from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+from compressed_tensors.quantization.quant_scheme import FP8_BLOCK, W4A16
+from datasets import load_dataset
+from loguru import logger
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from llmcompressor import oneshot
+from llmcompressor.datasets.utils import get_rank_partition
+from llmcompressor.modifiers.gptq import GPTQModifier
+from llmcompressor.utils import load_context
+
+MODEL_ID = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+SAVE_DIR = Path("Qwen3-235B-A22B-Instruct-2507-Attn-FP8B128-MoE-W4A16-G128-KV-FP8-GPTQ")
+OFFLOAD_DIR = Path("offload_qwen3_235b_mixed_quant")
+
+DATASET_ID = "HuggingFaceH4/ultrachat_200k"
+DATASET_SPLIT = "train_sft"
+NUM_CALIBRATION_SAMPLES = 512
+MAX_SEQUENCE_LENGTH = 2048
+SEED = 42
+
+# FP8_BLOCK is fixed to 128x128 weight blocks. W4A16 is fixed to group size 128.
+FP8_WEIGHT_BLOCK = (128, 128)
+W4_GROUP_SIZE = 128
+
+ATTENTION_PATTERN = re.compile(
+    r"^model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$"
+)
+ATTENTION_MODULE_PATTERN = re.compile(r"^model\.layers\.\d+\.self_attn$")
+EXPERT_PATTERN = re.compile(
+    r"^model\.layers\.\d+\.mlp\.experts\.\d+\."
+    r"(gate_proj|up_proj|down_proj)$"
+)
+
+ATTENTION_TARGETS = [f"re:{ATTENTION_PATTERN.pattern}"]
+MOE_TARGETS = [f"re:{EXPERT_PATTERN.pattern}"]
+
+# The targets are deliberately narrow; these ignores are additional safety
+# guards in case the target expressions are broadened later.
+IGNORE = [
+    r"re:.*lm_head$",
+    r"re:.*embed_tokens$",
+    r"re:.*\.mlp\.gate$",
+]
+
+
+def validate_targets(model):
+    """Fail early if model naming or block/group divisibility is unexpected."""
+    attention_modules = []
+    expert_modules = []
+
+    for name, module in model.named_modules():
+        if ATTENTION_PATTERN.fullmatch(name):
+            attention_modules.append((name, module))
+        elif EXPERT_PATTERN.fullmatch(name):
+            expert_modules.append((name, module))
+
+    if not attention_modules:
+        raise RuntimeError(
+            "No attention projections matched. Check the model revision and "
+            f"pattern {ATTENTION_PATTERN.pattern!r}."
+        )
+    if not expert_modules:
+        raise RuntimeError(
+            "No linearized expert projections matched. Ensure the model is loaded "
+            "inside llmcompressor.utils.load_context()."
+        )
+
+    block_rows, block_columns = FP8_WEIGHT_BLOCK
+    invalid_attention = []
+    for name, module in attention_modules:
+        rows, columns = module.weight.shape
+        if rows % block_rows or columns % block_columns:
+            invalid_attention.append((name, tuple(module.weight.shape)))
+
+    invalid_experts = []
+    for name, module in expert_modules:
+        columns = module.weight.shape[1]
+        if columns % W4_GROUP_SIZE:
+            invalid_experts.append((name, tuple(module.weight.shape)))
+
+    if invalid_attention:
+        raise ValueError(
+            "FP8 block-128 requires both weight dimensions to be divisible by "
+            f"128; invalid attention modules: {invalid_attention[:5]}"
+        )
+    if invalid_experts:
+        raise ValueError(
+            "W4A16-G128 requires the weight input dimension to be divisible by "
+            f"128; invalid expert modules: {invalid_experts[:5]}"
+        )
+
+    logger.info(
+        "Matched {} attention projections and {} expert projections",
+        len(attention_modules),
+        len(expert_modules),
+    )
+
+
+def build_calibration_dataset(tokenizer):
+    # Partition the global calibration set across torchrun ranks. With 512 samples
+    # and 8 ranks, each rank loads and processes a disjoint 64-sample slice.
+    rank_split = get_rank_partition(DATASET_SPLIT, NUM_CALIBRATION_SAMPLES)
+    logger.info(
+        "Rank {}/{} loading calibration split {}",
+        dist.get_rank(),
+        dist.get_world_size(),
+        rank_split,
+    )
+    dataset = load_dataset(
+        DATASET_ID,
+        split=rank_split,
+    )
+    dataset = dataset.select_columns(["messages"])
+    dataset = dataset.shuffle(seed=SEED)
+
+    def preprocess(example):
+        text = tokenizer.apply_chat_template(
+            example["messages"],
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return tokenizer(
+            text,
+            padding=False,
+            truncation=True,
+            max_length=MAX_SEQUENCE_LENGTH,
+            add_special_tokens=False,
+        )
+
+    return dataset.map(preprocess, remove_columns=dataset.column_names)
+
+
+def validate_kv_cache_scales(model):
+    """Verify that static K/V scales were calibrated on every attention layer."""
+    attention_modules = [
+        (name, module)
+        for name, module in model.named_modules()
+        if ATTENTION_MODULE_PATTERN.fullmatch(name)
+    ]
+    missing = [
+        name
+        for name, module in attention_modules
+        if not hasattr(module, "k_scale") or not hasattr(module, "v_scale")
+    ]
+    if not attention_modules:
+        raise RuntimeError(
+            "No attention modules found while validating KV-cache scales"
+        )
+    if missing:
+        raise RuntimeError(
+            f"KV-cache calibration did not produce k_scale/v_scale for: {missing[:5]}"
+        )
+    logger.info("Validated FP8 KV-cache scales on {} layers", len(attention_modules))
+
+
+def main():
+    # Must be launched with torchrun. Each rank is bound to one GPU, calibration
+    # data is partitioned below, and GPTQ modules are distributed across ranks.
+    init_dist()
+    OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # load_context converts Qwen3's fused 3-D expert tensors into individual
+    # per-expert Linear modules and installs offloading compatible with GPTQ hooks.
+    with load_context():
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            dtype="auto",
+            device_map="auto_offload",
+            offload_folder=str(OFFLOAD_DIR),
+            low_cpu_mem_usage=True,
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    validate_targets(model)
+    dataset = build_calibration_dataset(tokenizer)
+    local_num_calibration_samples = len(dataset)
+
+    # One GPTQModifier assigns disjoint schemes to attention and routed experts.
+    # It quantizes each target once and propagates GPTQ error in calibration order.
+    recipe = GPTQModifier(
+        config_groups={
+            "attention_w8a8_fp8_block128": QuantizationScheme(
+                targets=ATTENTION_TARGETS,
+                **FP8_BLOCK,
+            ),
+            "moe_w4a16_group128": QuantizationScheme(
+                targets=MOE_TARGETS,
+                **W4A16,
+            ),
+        },
+        # KV-cache quantization is separate from FP8_BLOCK activation quantization.
+        # Calibration writes one static FP8 scale for K and one for V per layer;
+        # the inference runtime uses them when its FP8 KV-cache mode is enabled.
+        kv_cache_scheme=QuantizationArgs(
+            num_bits=8,
+            type="float",
+            symmetric=True,
+            strategy="tensor",
+            dynamic=False,
+        ),
+        ignore=IGNORE,
+        block_size=128,
+        dampening_frac=0.01,
+        actorder="static",
+        # A 235B MoE has too many large Hessians to keep resident on GPU.
+        offload_hessians=False,
+    )
+
+    num_experts = getattr(model.config, "num_experts", 128)
+
+    # Attention and each linearized ExpertMLP become sequential subgraphs. The
+    # expert batch size follows the repository's large-MoE memory-saving recipe.
+    oneshot(
+        model=model,
+        tokenizer=tokenizer,
+        dataset=dataset,
+        recipe=recipe,
+        batch_size=1,
+        max_seq_length=MAX_SEQUENCE_LENGTH,
+        # This is the rank-local count (64 per rank for 512 samples / 8 ranks).
+        num_calibration_samples=local_num_calibration_samples,
+        shuffle_calibration_samples=False,
+        moe_calibrate_all_experts=True,
+        # sequential_targets=["Qwen3MoeAttention", "ExpertMLP"],
+        # sequential_targets_per_subgraph=(num_experts // 4 + 10),
+        # Overlap loading the next CPU-cached activation batch with GPU compute.
+        sequential_prefetch=True,
+    )
+
+    validate_kv_cache_scales(model)
+
+    logger.info("Saving compressed checkpoint to {}", SAVE_DIR)
+    model.save_pretrained(SAVE_DIR, save_compressed=True)
+    # The compressed model wrapper writes weights only on the source rank. Keep
+    # tokenizer/config side files single-writer as well, then synchronize teardown.
+    if dist.get_rank() == 0:
+        tokenizer.save_pretrained(SAVE_DIR)
+        logger.info("Quantization complete")
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+"""
+Mixed-precision GPTQ example for Qwen3-235B-A22B-Instruct-2507.
+
+Quantization layout:
+  - self-attention q/k/v/o projections: W8A8 FP8 block-128
+  - routed MoE expert gate/up/down projections: W4A16 INT4 group-128
+  - KV cache: static per-tensor FP8 with calibrated K/V scales
+  - router, embeddings, norms, and lm_head: original BF16
+
+FP8_BLOCK uses 128x128 weight blocks and dynamic 128-element activation groups.
+W4A16 uses symmetric INT4 weights with group size 128 and BF16 activations.
+
+This is a very large model. The script uses compressed-tensors offloading and
+sequential expert calibration, but the host still needs enough RAM and disk for
+the original checkpoint, offload cache, Hessians, and compressed checkpoint.
+"""
+
+import re
+from pathlib import Path
+
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from compressed_tensors.quantization.quant_scheme import FP8_BLOCK, W4A16
 from datasets import load_dataset
