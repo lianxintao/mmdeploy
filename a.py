@@ -1,3 +1,13 @@
+cd /home/lxt/lxt_projects/llm-compressor
+
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  TOKENIZERS_PARALLELISM=false \
+  torchrun \
+    --standalone \
+    --nnodes=1 \
+    --nproc-per-node=8 \
+    examples/quantizing_moe/qwen3_235b_attention_fp8_block_moe_w4a16.py
+
 """
 Mixed-precision GPTQ example for Qwen3-235B-A22B-Instruct-2507.
 
