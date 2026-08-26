@@ -1,3 +1,6 @@
+https://u142064-7877cc66c250.westd.seetacloud.com:8443
+
+
 Currently running servers:
 http://0.0.0.0:8888/jupyter/?token=jupyter-autodl-container-58a0ln8rhl-f39d70b5-5a64b30b01bd4463e8b9ceeab70ca2d9cf5977fb90c8244cfba198a62fe1d90a5 :: /root
 https://a142064-8rhl-f39d70b5.westb.seetacloud.com:8443/jupyter/lab
