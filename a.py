@@ -1,3 +1,7 @@
+Expanding KV Capacity with Online C128
+Give the KV cache room to grow. The Offline C128 baseline retains per-index state for each compressed page. Online C128 instead maintains a compact aggregate state, releasing more HBM to the KV-cache pool. It introduces additional state maintenance and speculative-verification work, but we observed no TPOT regression in our tests.
+
+
 https://u142064-7877cc66c250.westd.seetacloud.com:8443
 
 
