@@ -1,3 +1,17 @@
+SGLANG_ENABLE_CP_V2=1 sglang serve \
+    --model-path Qwen/Qwen3-30B-A3B-FP8 \
+    --tp-size 2 \
+    --pp-size 2 \
+    --ep-size 2 \
+    --attn-cp-size 2 \
+    --enable-prefill-cp \
+    --cp-strategy zigzag \
+    --prefill-attention-backend fa3 \
+    --decode-attention-backend flashinfer \
+    --disable-piecewise-cuda-graph
+
+
+
 # Adapted from qwen2_moe.py
 
 # Copyright 2023-2024 SGLang Team
