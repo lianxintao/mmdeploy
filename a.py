@@ -1,3 +1,18 @@
+  unset VLLM_MARLIN_INPUT_DTYPE
+  unset VLLM_USE_DEEP_GEMM
+  unset VLLM_MOE_USE_DEEP_GEMM
+  unset VLLM_USE_FLASHINFER_MOE_FP8
+
+  vllm serve Qwen/Qwen3-235B-A22B-Instruct-2507-FP8 \
+    --quantization fp8 \
+    --dtype bfloat16 \
+    --tensor-parallel-size 4 \
+    --linear-backend marlin \
+    --moe-backend marlin \
+    --trust-remote-code
+
+
+
 """
 Mixed-precision GPTQ example for Qwen3-235B-A22B-Instruct-2507.
 
