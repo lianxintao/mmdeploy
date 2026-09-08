@@ -1,4 +1,299 @@
-  unset VLLM_MARLIN_INPUT_DTYPE
+"""Qwen3-30B-A3B (MoE) RTN 混合量化: attention W8A8-FP8-block + MoE 专家 W4A16-INT4 + KV cache FP8.
+
+量化配置与大模型 (235B) GPTQ 脚本保持一致, 仅把 GPTQModifier 换成
+QuantizationModifier (RTN, round-to-nearest) —— 不做 Hessian 误差补偿,
+不需要校准数据做逐层反传, 量化速度大幅提升, 精度略降:
+
+  * attention q/k/v/o_proj -> W8A8 "FP8_BLOCK" 预设: fp8 权重 128x128 block +
+    动态 per-token-group-128 fp8 激活; 保存为 float-quantized
+    (weight fp8 [N,K] + weight_scale bf16 [N/128, K/128])
+  * MoE 专家 gate/up/down -> W4A16: int4 对称权重 g128 (minmax) + BF16 激活;
+    保存为 int-quantized (weight int8 值域 [-8,7] 未打包 +
+    weight_scale bf16 [N, K/128])
+  * KV cache -> 静态 per-tensor FP8: 校准后每层 self_attn 写入
+    k_scale/v_scale, 推理端启用 FP8 KV-cache 时消费
+  * router (mlp.gate)、embed_tokens、lm_head 保持 BF16 全精度
+
+流程 (与 quantize_qwen3_30b_rtn.py 相同, 已在 4090 48G 单卡验证):
+  * 加载: load_quantizable_moe 做 MoE 专家 2D 线性化, 模型整体驻留 CPU
+    (~61GB BF16), 不做磁盘 offload 流式
+  * 量化: pipeline="sequential" —— 当前层上载 GPU 逐层 RTN 量化, 其余层
+    驻留 CPU, GPU 峰值 ~2GB
+  * 保存前移除 offload 钩子 (OffloadCache), 避免与保存阶段的参数替换交互
+
+用法 (malloc 调优建议保留: 多核机器 glibc 多 arena 会让保存阶段异常变慢):
+  MALLOC_ARENA_MAX=2 MALLOC_MMAP_THRESHOLD_=33554432 MALLOC_TRIM_THRESHOLD_=33554432 \\
+  python quantize_qwen3_30b_w4a16_rtn.py \\
+      --model /root/autodl-tmp/Qwen3-30B-A3B-Instruct-2507 \\
+      --output /root/autodl-tmp/Qwen3-30B-A3B-Attn-FP8B128-MoE-W4A16-G128-KV-FP8-RTN \\
+      --calibration-data /autodl-fs/data/calibration_glm53/train.json \\
+      --num-samples 64 --max-seq-len 128
+"""
+
+import argparse
+import re
+
+import torch
+from compressed_tensors.offload.cache.base import OffloadCache
+from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
+from compressed_tensors.quantization.quant_scheme import PRESET_SCHEMES
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from llmcompressor import oneshot
+from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.modeling.moe.linearize import load_quantizable_moe
+
+# FP8_BLOCK 为 128x128 权重 block + 128 元素激活 group; MoE INT4 权重 g128。
+FP8_WEIGHT_BLOCK = (128, 128)
+W4_GROUP_SIZE = 128
+
+ATTENTION_PATTERN = re.compile(
+    r"^model\.layers\.\d+\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$"
+)
+ATTENTION_MODULE_PATTERN = re.compile(r"^model\.layers\.\d+\.self_attn$")
+EXPERT_PATTERN = re.compile(
+    r"^model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)$"
+)
+
+# 与 load_quantizable_moe 线性化后的命名一致: mlp.experts.<E>.<proj>
+ATTENTION_TARGETS = [f"re:{ATTENTION_PATTERN.pattern}"]
+MOE_TARGETS = [f"re:{EXPERT_PATTERN.pattern}"]
+
+# router / embedding / lm_head 对量化敏感, 保持全精度 (兜底防护)
+IGNORE = [
+    "lm_head",
+    r"re:.*embed_tokens$",
+    r"re:.*mlp\.gate$",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--model", default="/root/autodl-tmp/Qwen3-30B-A3B-Instruct-2507"
+    )
+    parser.add_argument(
+        "--output",
+        default="/root/autodl-tmp/"
+        "Qwen3-30B-A3B-Attn-FP8B128-MoE-W4A16-G128-KV-FP8-RTN",
+        help="量化模型保存目录 (int-quantized 未打包格式约 31GB)",
+    )
+    parser.add_argument(
+        "--calibration-data",
+        default="/autodl-fs/data/calibration_glm53/train.json",
+        help="自有校准数据 (JSONL, UltraChat 风格 messages 字段)",
+    )
+    parser.add_argument("--num-samples", type=int, default=64)
+    parser.add_argument("--max-seq-len", type=int, default=128)
+    return parser.parse_args()
+
+
+def validate_targets(model):
+    """提前校验: 模块命名符合预期, 且权重维度能被 block/group 整除。"""
+    attention_modules = []
+    expert_modules = []
+
+    for name, module in model.named_modules():
+        if ATTENTION_PATTERN.fullmatch(name):
+            attention_modules.append((name, module))
+        elif EXPERT_PATTERN.fullmatch(name):
+            expert_modules.append((name, module))
+
+    if not attention_modules:
+        raise RuntimeError(
+            "No attention projections matched. Check the model structure and "
+            f"pattern {ATTENTION_PATTERN.pattern!r}."
+        )
+    if not expert_modules:
+        raise RuntimeError(
+            "No linearized expert projections matched. Ensure the model is loaded "
+            "inside load_quantizable_moe()."
+        )
+
+    block_rows, block_columns = FP8_WEIGHT_BLOCK
+    invalid_attention = [
+        (name, tuple(module.weight.shape))
+        for name, module in attention_modules
+        if module.weight.shape[0] % block_rows or module.weight.shape[1] % block_columns
+    ]
+    invalid_experts = [
+        (name, tuple(module.weight.shape))
+        for name, module in expert_modules
+        if module.weight.shape[1] % W4_GROUP_SIZE
+    ]
+    if invalid_attention:
+        raise ValueError(
+            "FP8 block-128 requires both weight dimensions to be divisible by "
+            f"128; invalid attention modules: {invalid_attention[:5]}"
+        )
+    if invalid_experts:
+        raise ValueError(
+            f"W4A16-G{W4_GROUP_SIZE} requires the weight input dimension to be "
+            f"divisible by {W4_GROUP_SIZE}; invalid expert modules: "
+            f"{invalid_experts[:5]}"
+        )
+
+    print(
+        f"[validate] matched {len(attention_modules)} attention projections, "
+        f"{len(expert_modules)} expert projections",
+        flush=True,
+    )
+
+
+def build_calibration_dataset(tokenizer, data_file, num_samples, max_seq_len):
+    """自有数据: JSONL -> chat template 渲染 -> tokenize + 截断到 max_seq_len."""
+    ds = load_dataset("json", data_files=data_file, split="train")
+    ds = ds.shuffle(seed=42).select(range(min(num_samples, len(ds))))
+
+    def preprocess(row):
+        tools = row.get("tools")
+        kwargs = {"tools": tools} if tools else {}
+        text = tokenizer.apply_chat_template(
+            row["messages"], tokenize=False, add_generation_prompt=False, **kwargs
+        )
+        return {"text": text}
+
+    def tokenize(row):
+        return tokenizer(
+            row["text"],
+            padding=False,
+            max_length=max_seq_len,
+            truncation=True,
+            add_special_tokens=False,
+        )
+
+    return ds.map(preprocess).map(tokenize, remove_columns=ds.column_names)
+
+
+def validate_kv_cache_scales(model):
+    """确认每个 attention 层都写入了静态 K/V scale。"""
+    attention_modules = [
+        (name, module)
+        for name, module in model.named_modules()
+        if ATTENTION_MODULE_PATTERN.fullmatch(name)
+    ]
+    if not attention_modules:
+        raise RuntimeError("No attention modules found while validating KV-cache scales")
+    missing = [
+        name
+        for name, module in attention_modules
+        if not hasattr(module, "k_scale") or not hasattr(module, "v_scale")
+    ]
+    if missing:
+        raise RuntimeError(
+            f"KV-cache calibration did not produce k_scale/v_scale for: {missing[:5]}"
+        )
+    print(f"[validate] FP8 KV-cache scales present on {len(attention_modules)} layers", flush=True)
+
+
+def remove_all_offload(model):
+    """移除所有模块的 offload 钩子 (OffloadCache -> 普通 dict, 张量留在 CPU)。
+
+    保存阶段的逐模块参数替换与 OffloadCache 交互会导致逐模块变慢;
+    移除后按普通模块保存。"""
+
+    def restore(module):
+        params = module._parameters
+        if not isinstance(params, OffloadCache):
+            return False
+        module._parameters = params.offloaded_values
+        if isinstance(module._buffers, OffloadCache):
+            module._buffers = module._buffers.offloaded_values
+        if hasattr(module, "_original_forward_func"):
+            module.forward = module._original_forward_func.__get__(module)
+            del module._original_forward_func
+        return True
+
+    removed = sum(1 for m in model.modules() if restore(m))
+    print(f"[save-prep] removed offload hooks from {removed} modules", flush=True)
+
+
+def main():
+    args = parse_args()
+
+    # 纯 CPU 内存加载 (无磁盘 offload 流式) + MoE 专家直接 2D 线性化;
+    # sequential pipeline 量化时把当前层上载 GPU, 其余层驻留 CPU
+    with load_quantizable_moe():
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=torch.bfloat16, device_map="cpu"
+        )
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    validate_targets(model)
+    ds = build_calibration_dataset(
+        tokenizer, args.calibration_data, args.num_samples, args.max_seq_len
+    )
+
+    # 单个 QuantizationModifier 给 attention 与 MoE 专家分配互斥的 scheme,
+    # RTN 逐层直接取整, 无 Hessian / 无 dampening / 无 actorder
+    recipe = QuantizationModifier(
+        config_groups={
+            "attention_w8a8_fp8_block128": QuantizationScheme(
+                targets=ATTENTION_TARGETS,
+                **PRESET_SCHEMES["FP8_BLOCK"],
+            ),
+            "moe_w4a16_group128": QuantizationScheme(
+                targets=MOE_TARGETS,
+                weights=QuantizationArgs(
+                    num_bits=4,
+                    type="int",
+                    symmetric=True,
+                    strategy="group",
+                    group_size=W4_GROUP_SIZE,
+                    dynamic=False,
+                    observer="minmax",
+                ),
+            ),
+        },
+        # KV-cache 量化独立于 FP8_BLOCK 的激活量化: 校准为每层写一对静态
+        # FP8 scale (k_scale/v_scale), 推理 runtime 启用 FP8 KV-cache 时消费
+        kv_cache_scheme=QuantizationArgs(
+            num_bits=8,
+            type="float",
+            symmetric=True,
+            strategy="tensor",
+            dynamic=False,
+        ),
+        ignore=IGNORE,
+    )
+    print(
+        f"[recipe] RTN | attention=W8A8-FP8-block{FP8_WEIGHT_BLOCK[0]} | "
+        f"experts=W4A16-INT4-G{W4_GROUP_SIZE} | kv-cache=FP8-static-tensor | "
+        f"calib={len(ds)} x {args.max_seq_len} tok",
+        flush=True,
+    )
+
+    oneshot(
+        model=model,
+        processor=tokenizer,
+        dataset=ds,
+        recipe=recipe,
+        max_seq_length=args.max_seq_len,
+        num_calibration_samples=len(ds),
+        # 强制 sequential: 当前层上载 GPU 量化, 其余层驻留 CPU
+        pipeline="sequential",
+        sequential_offload_device="cpu",
+    )
+
+    validate_kv_cache_scales(model)
+
+    # 先移除 offload 钩子再保存 (见 remove_all_offload 说明)
+    remove_all_offload(model)
+
+    # 保存为 compressed-tensors 格式; 不强制 quantization_format, 按模块推断
+    # (fp8 -> float-quantized, int4 -> int-quantized 未打包)
+    model.save_pretrained(args.output, save_compressed=True)
+    tokenizer.save_pretrained(args.output)
+    print(f"[done] quantized model saved to {args.output}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+unset VLLM_MARLIN_INPUT_DTYPE
   unset VLLM_USE_DEEP_GEMM
   unset VLLM_MOE_USE_DEEP_GEMM
   unset VLLM_USE_FLASHINFER_MOE_FP8
